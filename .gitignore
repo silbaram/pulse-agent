@@ -1,0 +1,25 @@
+# Plan2Agent local harness state and artifacts
+# Planning artifacts, run logs, proposals, and generated harness files are local state.
+# Persist them through Plan2Agent Memory instead of committing them with application source.
+.plan2agent/
+
+# Dependencies / build outputs
+node_modules/
+build/
+dist/
+out/
+target/
+.gradle/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code local machine settings
+.claude/settings.local.json

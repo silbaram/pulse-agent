@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(~/**)",
+      "Write(~/**)",
+      "Edit(//etc/**)",
+      "Write(//etc/**)",
+      "Edit(//bin/**)",
+      "Write(//bin/**)",
+      "Edit(//sbin/**)",
+      "Write(//sbin/**)",
+      "Edit(//usr/**)",
+      "Write(//usr/**)",
+      "Edit(//var/**)",
+      "Write(//var/**)",
+      "Edit(//System/**)",
+      "Write(//System/**)",
+      "Edit(//Applications/**)",
+      "Write(//Applications/**)",
+      "Edit(//Program Files/**)",
+      "Write(//Program Files/**)",
+      "Edit(//Program Files (x86)/**)",
+      "Write(//Program Files (x86)/**)",
+      "Edit(//Windows/**)",
+      "Write(//Windows/**)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf ~/**)",
+      "Bash(sudo *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/p2a-confine-workspace.mjs"
+          }
+        ]
+      }
+    ]
+  }
+}

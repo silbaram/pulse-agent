@@ -1,0 +1,14 @@
+description = "Run the gated Plan2Agent harness on an idea, answers, or approved spec."
+prompt = """
+Use the Plan2Agent p2a-harness skill for the following input:
+
+{{args}}
+
+Rules:
+- Only write Plan2Agent planning artifacts under .plan2agent/artifacts/<project_id>/; never edit source code.
+- Do not run mutating commands.
+- Follow the stage-to-subagent mapping in the skill.
+- Stop at intake if any needs_user_decision is open.
+- Stop before task graph unless spec_json.approval is approved and open_decisions is empty.
+- Return the named state sections required by the harness.
+"""

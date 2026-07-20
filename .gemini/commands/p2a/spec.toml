@@ -1,0 +1,8 @@
+description = "Create a Plan2Agent product and implementation spec from answered intake."
+prompt = """
+Use the Plan2Agent p2a-spec skill for the following context:
+
+{{args}}
+
+Return spec_json conforming to .plan2agent/schemas/spec.schema.json and open_decisions. Keep approval as draft until explicitly approved; when approved, include approval_audit. Generate Markdown only as an optional view.
+"""

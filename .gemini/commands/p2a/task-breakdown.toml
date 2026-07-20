@@ -1,0 +1,8 @@
+description = "Create a Plan2Agent task graph from an approved implementation spec."
+prompt = """
+Use the Plan2Agent p2a-task-breakdown skill for the following approved implementation spec:
+
+{{args}}
+
+Return task_graph_json conforming to .plan2agent/schemas/task-graph.schema.json only. Do not implement tasks. Reject the request if the spec is not approved or open decisions remain.
+"""

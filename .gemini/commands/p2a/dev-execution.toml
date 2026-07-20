@@ -1,0 +1,8 @@
+description = "Implement a single ready Plan2Agent task and record the run."
+prompt = """
+Use the Plan2Agent p2a-dev-execution skill for the following ready task execution context:
+
+{{args}}
+
+Confirm the task is ready, start or use the run, implement only inside the target workspaceRef or worktree, run verify, finish with collected git state, update task status, and return the execution summary.
+"""
