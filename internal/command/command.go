@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"pulse-agent/internal/config"
 	"pulse-agent/internal/standalone"
 )
 
@@ -42,6 +43,8 @@ type standaloneRunner interface {
 	Run(context.Context) error
 }
 
+type configLoader func(string) (config.Config, error)
+
 type diagnostic struct {
 	SchemaVersion string           `json:"schema_version"`
 	Error         diagnosticDetail `json:"error"`
@@ -54,9 +57,14 @@ type diagnosticDetail struct {
 	Retryable bool   `json:"retryable"`
 }
 
+type configValidation struct {
+	SchemaVersion string `json:"schema_version"`
+	Valid         bool   `json:"valid"`
+}
+
 // Execute runs the requested command and returns its process exit code.
 func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return execute(ctx, args, stdout, stderr, standalone.New())
+	return executeWithConfig(ctx, args, stdout, stderr, standalone.New(), config.Load)
 }
 
 func execute(
@@ -65,6 +73,17 @@ func execute(
 	stdout io.Writer,
 	stderr io.Writer,
 	service standaloneRunner,
+) int {
+	return executeWithConfig(ctx, args, stdout, stderr, service, config.Load)
+}
+
+func executeWithConfig(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	service standaloneRunner,
+	loadConfig configLoader,
 ) int {
 	if len(args) == 0 {
 		writeTopLevelUsage(stderr)
@@ -77,7 +96,11 @@ func execute(
 	}
 
 	if args[0] == "standalone" {
-		return executeStandalone(ctx, args, stdout, stderr, service)
+		return executeStandalone(ctx, args, stdout, stderr, service, loadConfig)
+	}
+
+	if args[0] == "config" {
+		return executeConfig(args, stdout, stderr, loadConfig)
 	}
 
 	if _, ok := directCommands[args[0]]; ok {
@@ -97,19 +120,48 @@ func executeStandalone(
 	stdout io.Writer,
 	stderr io.Writer,
 	service standaloneRunner,
+	loadConfig configLoader,
 ) int {
 	if len(args) == 2 && isHelp(args[1]) {
-		fmt.Fprintln(stdout, "Usage: pulse-agent standalone")
+		fmt.Fprintln(stdout, "Usage: pulse-agent standalone --config <path>")
 		return ExitSuccess
 	}
-	if len(args) != 1 {
-		return writeError(stderr, ExitUsage, "invalid_arguments", "standalone", "standalone does not accept arguments")
+	if len(args) != 3 || args[1] != "--config" || args[2] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "standalone", "standalone requires --config <path>")
+	}
+	if _, err := loadConfig(args[2]); err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", "standalone", "configuration validation failed")
 	}
 
 	if err := service.Run(ctx); err != nil {
 		return writeError(stderr, ExitFailure, "standalone_failed", "standalone", err.Error())
 	}
 	return ExitSuccess
+}
+
+func executeConfig(args []string, stdout, stderr io.Writer, loadConfig configLoader) int {
+	if len(args) == 2 && isHelp(args[1]) {
+		writeConfigUsage(stdout)
+		return ExitSuccess
+	}
+	if len(args) < 2 {
+		writeGroupUsage(stderr, "config", commandGroups["config"])
+		return ExitUsage
+	}
+	if args[1] != "validate" {
+		return writeError(stderr, ExitUsage, "unknown_command", strings.Join(args[:2], " "), "unknown command")
+	}
+	if len(args) == 3 && isHelp(args[2]) {
+		writeConfigUsage(stdout)
+		return ExitSuccess
+	}
+	if len(args) != 4 || args[2] != "--config" || args[3] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "config validate", "config validate requires --config <path>")
+	}
+	if _, err := loadConfig(args[3]); err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", "config validate", "configuration validation failed")
+	}
+	return writeConfigValidation(stdout)
 }
 
 func executeRecognized(args []string, stdout, stderr io.Writer) int {
@@ -183,6 +235,19 @@ func writeError(stderr io.Writer, exitCode int, code, commandName, message strin
 	return exitCode
 }
 
+func writeConfigValidation(stdout io.Writer) int {
+	result := configValidation{
+		SchemaVersion: "pulse-agent.cli.config_validation.v1",
+		Valid:         true,
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(result); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
 func writeTopLevelUsage(output io.Writer) {
 	fmt.Fprint(output, `Usage: pulse-agent <command> [arguments]
 
@@ -210,6 +275,10 @@ func writeGroupUsage(output io.Writer, group string, subcommands map[string]stru
 			fmt.Fprintf(output, "  %s\n", subcommand)
 		}
 	}
+}
+
+func writeConfigUsage(output io.Writer) {
+	fmt.Fprintln(output, "Usage: pulse-agent config validate --config <path>")
 }
 
 func orderedSubcommands(group string) []string {

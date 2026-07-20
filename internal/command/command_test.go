@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"pulse-agent/internal/config"
 )
 
 type runnerFunc func(context.Context) error
@@ -59,7 +63,6 @@ func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing
 		name string
 		args []string
 	}{
-		{name: "config validate", args: []string{"config", "validate"}},
 		{name: "target register", args: []string{"target", "register"}},
 		{name: "runbook validate", args: []string{"runbook", "validate"}},
 		{name: "runbook register", args: []string{"runbook", "register"}},
@@ -118,15 +121,16 @@ func TestExecute_StandaloneUsesCallerContext(t *testing.T) {
 	var stderr bytes.Buffer
 	called := false
 
-	exitCode := execute(
+	exitCode := executeWithConfig(
 		ctx,
-		[]string{"standalone"},
+		[]string{"standalone", "--config", "test.json"},
 		&stdout,
 		&stderr,
 		runnerFunc(func(got context.Context) error {
 			called = true
 			return got.Err()
 		}),
+		func(string) (config.Config, error) { return config.Config{}, nil },
 	)
 
 	if !called {
@@ -145,6 +149,115 @@ func TestExecute_StandaloneUsesCallerContext(t *testing.T) {
 	}
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("context error = %v, want %v", ctx.Err(), context.Canceled)
+	}
+}
+
+func TestExecute_ConfigValidateReadsOnlyConfigAndDoesNotExposeSecrets(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "config", "testdata", "valid-production.json"))
+	if err != nil {
+		t.Fatalf("read valid fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write config fixture: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat config fixture before validation: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(
+		context.Background(),
+		[]string{"config", "validate", "--config", path},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { t.Fatal("config validate started standalone service"); return nil }),
+	)
+
+	if exitCode != ExitSuccess {
+		t.Fatalf("execute() exit code = %d, want %d; stderr = %s", exitCode, ExitSuccess, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("execute() stderr = %q, want empty", stderr.String())
+	}
+	var result configValidation
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode validation result %q: %v", stdout.String(), err)
+	}
+	if result.SchemaVersion != "pulse-agent.cli.config_validation.v1" || !result.Valid {
+		t.Errorf("validation result = %#v, want valid config result", result)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat config fixture after validation: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Error("config validate changed the configuration file modification time")
+	}
+}
+
+func TestExecute_ConfigValidateReturnsSecretFreeDiagnostic(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "config", "testdata", "invalid-plain-secret.json"))
+	if err != nil {
+		t.Fatalf("read invalid fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write invalid fixture: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(
+		context.Background(),
+		[]string{"config", "validate", "--config", path},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { t.Fatal("config validate started standalone service"); return nil }),
+	)
+
+	if exitCode != ExitFailure {
+		t.Fatalf("execute() exit code = %d, want %d", exitCode, ExitFailure)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("execute() stdout = %q, want empty", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "very-secret-value") || strings.Contains(stderr.String(), "env:KEY") {
+		t.Fatalf("diagnostic exposed secret material: %q", stderr.String())
+	}
+	var got diagnostic
+	if err := json.Unmarshal(stderr.Bytes(), &got); err != nil {
+		t.Fatalf("decode diagnostic %q: %v", stderr.String(), err)
+	}
+	if got.Error.Code != "config_invalid" || got.Error.Command != "config validate" {
+		t.Errorf("diagnostic = %#v, want config_invalid for config validate", got)
+	}
+}
+
+func TestExecute_StandaloneRejectsInvalidConfigBeforeStartingService(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	called := false
+
+	exitCode := executeWithConfig(
+		context.Background(),
+		[]string{"standalone", "--config", "invalid.json"},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { called = true; return nil }),
+		func(string) (config.Config, error) { return config.Config{}, errors.New("invalid configuration") },
+	)
+
+	if exitCode != ExitFailure {
+		t.Fatalf("execute() exit code = %d, want %d", exitCode, ExitFailure)
+	}
+	if called {
+		t.Fatal("standalone service started after configuration validation failed")
+	}
+	if strings.Contains(stderr.String(), "invalid.json") {
+		t.Fatalf("diagnostic exposed configuration path: %q", stderr.String())
 	}
 }
 

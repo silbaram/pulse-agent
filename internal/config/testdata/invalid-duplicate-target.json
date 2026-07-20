@@ -1,0 +1,18 @@
+{
+  "schema_version": "v1",
+  "usage_mode": "production",
+  "data_directory": "/var/lib/pulse-agent",
+  "evidence_directory": "/var/lib/pulse-agent/evidence",
+  "docker": {"endpoint": "unix:///var/run/docker.sock"},
+  "admin": {"socket_path": "/var/lib/pulse-agent/admin.sock"},
+  "limits": {"max_targets": 2, "retention": {"max_age": "1h", "max_bytes": 1024}},
+  "allowed_targets": [
+    {"target_id": "checkout", "adapter_type": "docker"},
+    {"target_id": "checkout", "adapter_type": "docker"}
+  ],
+  "gemini": {"provider": "gemini", "model": "gemini-2.5-flash", "timeout": "30s", "data_processing_mode": "billing_enabled", "api_key_ref": "env:KEY"},
+  "webhooks": {
+    "ingress": {"endpoint": "https://alerts.example.com", "secret_ref": "env:INGRESS"},
+    "outbound": {"endpoint": "https://notify.example.com", "secret_ref": "env:OUTBOUND"}
+  }
+}
