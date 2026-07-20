@@ -107,6 +107,12 @@ func TestStore_StoresRecordsInEveryContractBucket(t *testing.T) {
 	}
 	if err := store.Update(func(transaction *Tx) error {
 		for bucket, value := range records {
+			if bucket == BucketAudit {
+				if err := transaction.AppendAudit("record-1", value); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := transaction.Put(bucket, "record-1", value); err != nil {
 				return err
 			}
@@ -122,6 +128,39 @@ func TestStore_StoresRecordsInEveryContractBucket(t *testing.T) {
 			if err != nil || !found || !bytes.Equal(got, want) {
 				t.Fatalf("Get(%q) = %q, found %t, error %v; want %q", bucket, got, found, err, want)
 			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View() error = %v", err)
+	}
+}
+
+func TestTx_AuditBucketIsAppendOnly(t *testing.T) {
+	store := openTestStore(t, testOptions(t, "state.db"))
+	defer store.Close()
+
+	if err := store.Update(func(transaction *Tx) error {
+		if err := transaction.Put(BucketAudit, "event-1", []byte("record")); !errors.Is(err, ErrAuditAppendOnly) {
+			t.Fatalf("Put(BucketAudit) error = %v, want errors.Is(_, %v)", err, ErrAuditAppendOnly)
+		}
+		if err := transaction.AppendAudit("event-1", []byte("record")); err != nil {
+			return err
+		}
+		if err := transaction.AppendAudit("event-1", []byte("replacement")); !errors.Is(err, ErrAuditAppendOnly) {
+			t.Fatalf("second AppendAudit() error = %v, want errors.Is(_, %v)", err, ErrAuditAppendOnly)
+		}
+		if err := transaction.Delete(BucketAudit, "event-1"); !errors.Is(err, ErrAuditAppendOnly) {
+			t.Fatalf("Delete(BucketAudit) error = %v, want errors.Is(_, %v)", err, ErrAuditAppendOnly)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	if err := store.View(func(transaction *Tx) error {
+		value, found, err := transaction.Get(BucketAudit, "event-1")
+		if err != nil || !found || string(value) != "record" {
+			t.Fatalf("Get() = %q, found %t, error %v", value, found, err)
 		}
 		return nil
 	}); err != nil {
@@ -214,6 +253,12 @@ func TestStore_BackupRestoreReproducesRecordsAndSchema(t *testing.T) {
 	}
 	if err := source.Update(func(transaction *Tx) error {
 		for bucket, value := range records {
+			if bucket == BucketAudit {
+				if err := transaction.AppendAudit("record-1", value); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := transaction.Put(bucket, "record-1", value); err != nil {
 				return err
 			}

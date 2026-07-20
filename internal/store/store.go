@@ -45,6 +45,9 @@ var (
 	ErrInvalidKey = errors.New("invalid local store key")
 	// ErrInvalidTransaction indicates a missing transaction callback.
 	ErrInvalidTransaction = errors.New("invalid local store transaction")
+	// ErrAuditAppendOnly indicates an attempt to replace or delete a persisted
+	// audit record outside the audited append path.
+	ErrAuditAppendOnly = errors.New("audit records are append-only")
 	// ErrStoreFull indicates a storage-full condition. It wraps both actual
 	// ENOSPC errors and the deterministic configured-size guard.
 	ErrStoreFull = errors.New("local store is full")
@@ -247,6 +250,9 @@ func (tx *Tx) Put(bucket Bucket, key string, value []byte) error {
 	if err != nil {
 		return err
 	}
+	if bucket == BucketAudit {
+		return ErrAuditAppendOnly
+	}
 	if key == "" {
 		return ErrInvalidKey
 	}
@@ -276,10 +282,30 @@ func (tx *Tx) Delete(bucket Bucket, key string) error {
 	if err != nil {
 		return err
 	}
+	if bucket == BucketAudit {
+		return ErrAuditAppendOnly
+	}
 	if key == "" {
 		return ErrInvalidKey
 	}
 	return normalizeError(databaseBucket.Delete([]byte(key)))
+}
+
+// AppendAudit stores one previously absent serialized audit event. Callers must
+// validate its event chain before calling this method; existing audit records
+// can never be replaced or deleted through Tx.
+func (tx *Tx) AppendAudit(key string, value []byte) error {
+	databaseBucket, err := tx.bucket(BucketAudit)
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		return ErrInvalidKey
+	}
+	if databaseBucket.Get([]byte(key)) != nil {
+		return ErrAuditAppendOnly
+	}
+	return normalizeError(databaseBucket.Put([]byte(key), value))
 }
 
 // ForEach calls fn for a stable transaction snapshot of one explicit bucket.
