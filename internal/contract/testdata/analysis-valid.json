@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1",
+  "incident_id": "incident-1",
+  "hypotheses": [
+    {
+      "summary": "health probe failed",
+      "evidence_refs": ["evidence-1"]
+    }
+  ],
+  "evidence_refs": ["evidence-1"],
+  "confidence_labels": ["high"],
+  "notification_recommendation": "notify",
+  "candidate_runbook_ids": ["runbook-1"],
+  "missing_evidence": []
+}

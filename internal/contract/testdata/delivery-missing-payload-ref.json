@@ -1,0 +1,12 @@
+{
+  "schema_version": "v1",
+  "delivery_id": "delivery-1",
+  "payload_type": "incident_report",
+  "payload_ref": "",
+  "webhook_id": "webhook-1",
+  "destination_ref": "webhook:operations",
+  "attempt_count": 0,
+  "next_attempt_at": "2026-07-20T12:00:00Z",
+  "expires_at": "2026-07-20T13:00:00Z",
+  "state": "pending"
+}
