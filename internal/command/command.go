@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"time"
 
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/incident"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/standalone"
 	"pulse-agent/internal/target"
@@ -56,6 +59,8 @@ type adminClient interface {
 	Backup(context.Context, string, string, io.Writer) error
 	Register(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
 	RegisterRunbook(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
+	ListIncidents(context.Context, string, string, incident.Filter) (incident.Page, error)
+	ShowIncident(context.Context, string, string, string) (contract.Incident, error)
 }
 
 type configLoader func(string) (config.Config, error)
@@ -154,12 +159,93 @@ func executeWithDependencies(
 	if args[0] == "runbook" {
 		return executeRunbook(ctx, args, stdout, stderr, loadConfig, client)
 	}
+	if args[0] == "incident" {
+		return executeIncident(ctx, args, stdout, stderr, loadConfig, client)
+	}
 
 	if subcommands, ok := commandGroups[args[0]]; ok {
 		return executeGroup(args, stdout, stderr, subcommands)
 	}
 
 	return writeError(stderr, ExitUsage, "unknown_command", args[0], "unknown command")
+}
+
+func executeIncident(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {
+	if len(args) >= 2 && isHelp(args[len(args)-1]) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent incident list --config <path> [--state <state>] [--page-size <1-100>] [--offset <n>]\n       pulse-agent incident show --config <path> --id <incident-id>")
+		return ExitSuccess
+	}
+	if len(args) < 4 {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "incident", "incident query requires --config <path>")
+	}
+	if args[1] == "show" && len(args) == 6 && args[2] == "--config" && args[4] == "--id" && args[3] != "" && args[5] != "" {
+		cfg, err := loadConfig(args[3])
+		if err != nil {
+			return writeError(stderr, ExitFailure, "config_invalid", "incident show", "configuration validation failed")
+		}
+		value, err := client.ShowIncident(ctx, cfg.Admin.SocketPath, adminipc.DefaultReasonCode, args[5])
+		if err != nil {
+			return writeAdminRequestError(stderr, "incident show", err)
+		}
+		return writeJSON(stdout, value)
+	}
+	if args[1] != "list" || args[2] != "--config" || args[3] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "incident", "invalid incident query arguments")
+	}
+	filter := incident.Filter{}
+	for index := 4; index < len(args); index += 2 {
+		if index+1 >= len(args) {
+			return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "invalid incident list options")
+		}
+		switch args[index] {
+		case "--state":
+			filter.State = contract.IncidentState(args[index+1])
+		case "--page-size":
+			value, err := strconv.Atoi(args[index+1])
+			if err != nil {
+				return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "invalid page size")
+			}
+			filter.PageSize = value
+		case "--offset":
+			value, err := strconv.Atoi(args[index+1])
+			if err != nil {
+				return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "invalid offset")
+			}
+			filter.Offset = value
+		case "--from":
+			value, err := time.Parse(time.RFC3339, args[index+1])
+			if err != nil {
+				return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "invalid from time")
+			}
+			filter.From = value
+		case "--to":
+			value, err := time.Parse(time.RFC3339, args[index+1])
+			if err != nil {
+				return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "invalid to time")
+			}
+			filter.To = value
+		default:
+			return writeError(stderr, ExitUsage, "invalid_arguments", "incident list", "unknown incident list option")
+		}
+	}
+	cfg, err := loadConfig(args[3])
+	if err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", "incident list", "configuration validation failed")
+	}
+	page, err := client.ListIncidents(ctx, cfg.Admin.SocketPath, adminipc.DefaultReasonCode, filter)
+	if err != nil {
+		return writeAdminRequestError(stderr, "incident list", err)
+	}
+	return writeJSON(stdout, page)
+}
+
+func writeJSON(stdout io.Writer, value any) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
 }
 
 func executeRunbook(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {
@@ -359,6 +445,9 @@ func parseAdminArguments(args []string) (configPath, reasonCode string, ok bool)
 }
 
 func writeAdminRequestError(stderr io.Writer, commandName string, err error) int {
+	if errors.Is(err, adminipc.ErrIncidentNotFound) {
+		return writeError(stderr, ExitFailure, "not_found", commandName, "incident was not found")
+	}
 	if errors.Is(err, adminipc.ErrInvalidOptions) {
 		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "invalid administrative request")
 	}

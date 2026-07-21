@@ -9,6 +9,7 @@ import (
 	"io"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/incident"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
@@ -53,6 +54,9 @@ var (
 	// ErrRequestRejected indicates that the daemon rejected an authenticated
 	// administrative request without making a state change.
 	ErrRequestRejected = errors.New("administrative request rejected")
+	// ErrIncidentNotFound indicates that an authorized incident show request did
+	// not match a durable incident record.
+	ErrIncidentNotFound = errors.New("incident not found")
 	// ErrResponseTruncated indicates a backup response that ended before its
 	// declared snapshot length was received.
 	ErrResponseTruncated = errors.New("administrative response truncated")
@@ -71,6 +75,8 @@ const (
 	OperationTargetRegister Operation = "target.register"
 	// OperationRunbookRegister submits one validated typed runbook to the daemon.
 	OperationRunbookRegister Operation = "runbook.register"
+	OperationIncidentList    Operation = "incident.list"
+	OperationIncidentShow    Operation = "incident.show"
 )
 
 // StatusState identifies the lifecycle state returned by an administrative
@@ -121,7 +127,9 @@ type Request struct {
 	// Target is present only for a target registration request.
 	Target *contract.ServiceTarget `json:"target,omitempty"`
 	// Runbook is present only for a runbook registration request.
-	Runbook *contract.Runbook `json:"runbook,omitempty"`
+	Runbook        *contract.Runbook `json:"runbook,omitempty"`
+	IncidentFilter *incident.Filter  `json:"incident_filter,omitempty"`
+	IncidentID     string            `json:"incident_id,omitempty"`
 }
 
 type result string
@@ -140,6 +148,8 @@ type response struct {
 	BackupSize    int64                       `json:"backup_size,omitempty"`
 	TargetResult  *target.RegistrationResult  `json:"target_result,omitempty"`
 	RunbookResult *runbook.RegistrationResult `json:"runbook_result,omitempty"`
+	IncidentPage  *incident.Page              `json:"incident_page,omitempty"`
+	Incident      *contract.Incident          `json:"incident,omitempty"`
 }
 
 func (r Request) validate() error {
@@ -155,8 +165,16 @@ func (r Request) validate() error {
 		if r.Runbook == nil || r.Runbook.SchemaVersion != SchemaVersion || r.Target != nil {
 			return ErrMalformedRequest
 		}
+	case OperationIncidentList:
+		if r.IncidentFilter == nil || r.IncidentID != "" || r.Target != nil || r.Runbook != nil || !validIncidentFilter(*r.IncidentFilter) {
+			return ErrMalformedRequest
+		}
+	case OperationIncidentShow:
+		if r.IncidentID == "" || r.IncidentFilter != nil || r.Target != nil || r.Runbook != nil {
+			return ErrMalformedRequest
+		}
 	default:
-		if r.Target != nil || r.Runbook != nil {
+		if r.Target != nil || r.Runbook != nil || r.IncidentFilter != nil || r.IncidentID != "" {
 			return ErrMalformedRequest
 		}
 	}
@@ -182,7 +200,7 @@ func (r response) validate() error {
 	if r.Status != nil && !r.Status.valid() {
 		return ErrMalformedResponse
 	}
-	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) || (r.RunbookResult != nil && !validRunbookResult(*r.RunbookResult)) {
+	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) || (r.RunbookResult != nil && !validRunbookResult(*r.RunbookResult)) || (r.IncidentPage != nil && !validIncidentPage(*r.IncidentPage)) || (r.Incident != nil && r.Incident.Validate() != nil) {
 		return ErrMalformedResponse
 	}
 	return nil
@@ -200,6 +218,12 @@ func responsePayloadCount(value response) int {
 		count++
 	}
 	if value.RunbookResult != nil {
+		count++
+	}
+	if value.IncidentPage != nil {
+		count++
+	}
+	if value.Incident != nil {
 		count++
 	}
 	return count
@@ -234,7 +258,22 @@ func (s Status) valid() bool {
 }
 
 func validOperation(operation Operation) bool {
-	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister || operation == OperationRunbookRegister
+	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister || operation == OperationRunbookRegister || operation == OperationIncidentList || operation == OperationIncidentShow
+}
+
+func validIncidentFilter(filter incident.Filter) bool {
+	return filter.Offset >= 0 && filter.PageSize >= 0 && filter.PageSize <= 100 && (filter.State == "" || filter.State == contract.IncidentOpen || filter.State == contract.IncidentAnalyzing || filter.State == contract.IncidentAwaitingApproval || filter.State == contract.IncidentRecovering || filter.State == contract.IncidentStabilizing || filter.State == contract.IncidentClosed || filter.State == contract.IncidentFailed) && (filter.From.IsZero() || filter.To.IsZero() || !filter.To.Before(filter.From))
+}
+func validIncidentPage(page incident.Page) bool {
+	if page.NextOffset < 0 || len(page.Incidents) > 100 {
+		return false
+	}
+	for _, value := range page.Incidents {
+		if value.Validate() != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func validRequestID(value string) bool {

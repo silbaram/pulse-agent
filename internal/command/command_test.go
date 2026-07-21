@@ -15,6 +15,7 @@ import (
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/incident"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
@@ -30,6 +31,21 @@ type fakeAdminClient struct {
 	backup          func(context.Context, string, string, io.Writer) error
 	register        func(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
 	registerRunbook func(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
+	listIncidents   func(context.Context, string, string, incident.Filter) (incident.Page, error)
+	showIncident    func(context.Context, string, string, string) (contract.Incident, error)
+}
+
+func (c fakeAdminClient) ListIncidents(ctx context.Context, socketPath, reason string, filter incident.Filter) (incident.Page, error) {
+	if c.listIncidents == nil {
+		return incident.Page{}, errors.New("unexpected incident list")
+	}
+	return c.listIncidents(ctx, socketPath, reason, filter)
+}
+func (c fakeAdminClient) ShowIncident(ctx context.Context, socketPath, reason, id string) (contract.Incident, error) {
+	if c.showIncident == nil {
+		return contract.Incident{}, errors.New("unexpected incident show")
+	}
+	return c.showIncident(ctx, socketPath, reason, id)
 }
 
 func (c fakeAdminClient) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
@@ -97,13 +113,29 @@ func TestExecute_HelpExposesApprovedCommands(t *testing.T) {
 	}
 }
 
+func TestExecute_IncidentListUsesDaemonClient(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+	loader := func(string) (config.Config, error) {
+		return config.Config{Admin: config.AdminConfig{SocketPath: "/tmp/admin.sock"}}, nil
+	}
+	client := fakeAdminClient{listIncidents: func(_ context.Context, socketPath, _ string, filter incident.Filter) (incident.Page, error) {
+		called = socketPath == "/tmp/admin.sock" && filter.State == contract.IncidentOpen && filter.PageSize == 1
+		return incident.Page{Incidents: []contract.Incident{}}, nil
+	}}
+	if code := executeWithDependencies(context.Background(), []string{"incident", "list", "--config", "config.json", "--state", "open", "--page-size", "1"}, &stdout, &stderr, runnerFunc(func(context.Context) error { return nil }), loader, client); code != ExitSuccess {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("incident list did not use daemon client")
+	}
+}
+
 func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
 	}{
-		{name: "incident list", args: []string{"incident", "list"}},
-		{name: "incident show", args: []string{"incident", "show"}},
 		{name: "approval grant", args: []string{"approval", "grant"}},
 		{name: "approval deny", args: []string{"approval", "deny"}},
 	}

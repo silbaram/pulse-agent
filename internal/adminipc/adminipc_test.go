@@ -54,6 +54,24 @@ func TestClient_UsesInjectedRequestID(t *testing.T) {
 	stop()
 }
 
+func TestClient_ShowIncidentReturnsNotFound(t *testing.T) {
+	state := openTestStore(t)
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) { return authorizedTestActor, nil })
+	defer stop()
+	client, err := NewClient(ClientOptions{RequestTimeout: time.Second, Clock: time.Now, NewRequestID: func() (string, error) { return "request-not-found", nil }})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if _, err := client.ShowIncident(context.Background(), socketPath, "operator_requested", "incident-missing"); !errors.Is(err, ErrIncidentNotFound) {
+		t.Fatalf("ShowIncident() error = %v, want %v", err, ErrIncidentNotFound)
+	}
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	assertAuditEvent(t, events[0], "incident.show", auditResultRejected, "not_found")
+}
+
 func TestServer_UsesInjectedClockAndAuditID(t *testing.T) {
 	state := openTestStore(t)
 	clock := time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/incident"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
@@ -92,7 +93,7 @@ func NewProductionClient() (*Client, error) {
 
 // Status requests the safe bounded daemon status without opening local state.
 func (c *Client) Status(ctx context.Context, socketPath, reasonCode string) (Status, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil, nil)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil, nil, nil, "")
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -114,7 +115,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	if destination == nil {
 		return ErrInvalidOptions
 	}
-	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil, nil)
+	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil, nil, nil, "")
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -143,7 +144,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 // Register submits a strict target document to the daemon. The client never
 // opens local state, performs a target-store transaction, or writes audit data.
 func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, submitted contract.ServiceTarget) (target.RegistrationResult, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted, nil)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted, nil, nil, "")
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -162,7 +163,7 @@ func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, su
 // RegisterRunbook submits a previously validated typed runbook through the
 // daemon-owned local IPC boundary.
 func (c *Client) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationRunbookRegister, reasonCode, nil, &submitted)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationRunbookRegister, reasonCode, nil, &submitted, nil, "")
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -178,7 +179,44 @@ func (c *Client) RegisterRunbook(ctx context.Context, socketPath, reasonCode str
 	return *response.RunbookResult, nil
 }
 
-func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget, submittedRunbook *contract.Runbook) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
+func (c *Client) ListIncidents(ctx context.Context, socketPath, reasonCode string, filter incident.Filter) (incident.Page, error) {
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentList, reasonCode, nil, nil, &filter, "")
+	if stopClose != nil {
+		defer stopClose()
+	}
+	if connection != nil {
+		defer connection.Close()
+	}
+	if err != nil {
+		return incident.Page{}, err
+	}
+	if response.IncidentPage == nil {
+		return incident.Page{}, ErrMalformedResponse
+	}
+	return *response.IncidentPage, nil
+}
+
+func (c *Client) ShowIncident(ctx context.Context, socketPath, reasonCode, id string) (contract.Incident, error) {
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentShow, reasonCode, nil, nil, nil, id)
+	if stopClose != nil {
+		defer stopClose()
+	}
+	if connection != nil {
+		defer connection.Close()
+	}
+	if errors.Is(err, ErrRequestRejected) && response.ErrorCode == errorIncidentNotFound {
+		return contract.Incident{}, ErrIncidentNotFound
+	}
+	if err != nil {
+		return contract.Incident{}, err
+	}
+	if response.Incident == nil {
+		return contract.Incident{}, ErrMalformedResponse
+	}
+	return *response.Incident, nil
+}
+
+func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget, submittedRunbook *contract.Runbook, filter *incident.Filter, incidentID string) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
 	if ctx == nil || c == nil || c.requestTimeout <= 0 || c.clock == nil || c.newRequestID == nil || !validOperation(operation) || !validReasonCode(reasonCode) {
 		return response{}, nil, nil, nil, ErrInvalidOptions
 	}
@@ -195,12 +233,14 @@ func (c *Client) request(ctx context.Context, socketPath string, operation Opera
 	})
 
 	request := Request{
-		SchemaVersion: SchemaVersion,
-		RequestID:     requestID,
-		Operation:     operation,
-		ReasonCode:    reasonCode,
-		Target:        submitted,
-		Runbook:       submittedRunbook,
+		SchemaVersion:  SchemaVersion,
+		RequestID:      requestID,
+		Operation:      operation,
+		ReasonCode:     reasonCode,
+		Target:         submitted,
+		Runbook:        submittedRunbook,
+		IncidentFilter: filter,
+		IncidentID:     incidentID,
 	}
 	if err := writeMessage(connection, request); err != nil {
 		stopClose()
@@ -223,7 +263,7 @@ func (c *Client) request(ctx context.Context, socketPath string, operation Opera
 	if decoded.Result == resultFailure {
 		stopClose()
 		_ = connection.Close()
-		return response{}, nil, nil, nil, ErrRequestRejected
+		return decoded, nil, nil, nil, ErrRequestRejected
 	}
 
 	return decoded, reader, connection, stopClose, nil

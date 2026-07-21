@@ -12,6 +12,7 @@ import (
 
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/incident"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
@@ -30,6 +31,7 @@ const (
 	errorPermissionDenied    = "permission_denied"
 	errorMalformedRequest    = "malformed_request"
 	errorTargetRejected      = "target_rejected"
+	errorIncidentNotFound    = "incident_not_found"
 	auditReasonUnsupported   = "unsupported_operation"
 	statusCapabilityAdminIPC = "admin_ipc"
 	statusUnsupportedHost    = "host_power_os_network_outage"
@@ -78,6 +80,7 @@ type Server struct {
 	state           *store.Store
 	targets         *target.Registry
 	runbooks        *runbook.Registry
+	incidents       *incident.Query
 	requestTimeout  time.Duration
 	peerCredentials PeerCredentials
 	clock           func() time.Time
@@ -125,6 +128,10 @@ func NewServer(options Options) (*Server, error) {
 		peerCredentials = platformPeerCredentials
 	}
 
+	incidents, err := incident.NewQuery(options.State)
+	if err != nil {
+		return nil, ErrInvalidOptions
+	}
 	return &Server{
 		socketPath:      options.SocketPath,
 		ownerUID:        uint32(os.Getuid()),
@@ -134,6 +141,7 @@ func NewServer(options Options) (*Server, error) {
 		state:           options.State,
 		targets:         options.Targets,
 		runbooks:        options.Runbooks,
+		incidents:       incidents,
 		requestTimeout:  timeout,
 		peerCredentials: peerCredentials,
 		clock:           options.Clock,
@@ -441,6 +449,27 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
 		}
 		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, RunbookResult: &result})
+	case OperationIncidentList:
+		page, err := s.incidents.List(*request.IncidentFilter)
+		if err != nil {
+			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
+		}
+		if err := s.appendAudit(actor, request.RequestID, "incident.list", auditResultAccepted, request.ReasonCode); err != nil {
+			return err
+		}
+		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, IncidentPage: &page})
+	case OperationIncidentShow:
+		value, err := s.incidents.Show(request.IncidentID)
+		if err != nil {
+			if auditErr := s.appendAudit(actor, request.RequestID, "incident.show", auditResultRejected, "not_found"); auditErr != nil {
+				return auditErr
+			}
+			return writeMessage(connection, failureResponse(request.RequestID, errorIncidentNotFound))
+		}
+		if err := s.appendAudit(actor, request.RequestID, "incident.show", auditResultAccepted, request.ReasonCode); err != nil {
+			return err
+		}
+		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, Incident: &value})
 	}
 	return ErrMalformedRequest
 }
