@@ -15,15 +15,78 @@ import (
 	"pulse-agent/internal/target"
 )
 
+const (
+	defaultRequestTimeout = 5 * time.Second
+
+	// DefaultRequestTimeout bounds one local administrative IPC request when a
+	// caller does not need a narrower deadline.
+	DefaultRequestTimeout = defaultRequestTimeout
+)
+
+// ClientOptions configures an administrative IPC client. Clock and
+// NewRequestID are explicit so callers can keep time and request correlation
+// deterministic in controlled tests.
+type ClientOptions struct {
+	// RequestTimeout bounds one request and its response stream.
+	RequestTimeout time.Duration
+	// Clock returns the current time used to calculate connection deadlines.
+	Clock func() time.Time
+	// NewRequestID returns a unique, protocol-safe request identifier.
+	NewRequestID func() (string, error)
+}
+
+// SystemClock returns the current wall-clock time for production assembly.
+func SystemClock() time.Time {
+	return time.Now()
+}
+
+// NewRequestID returns a cryptographically random, protocol-safe request ID.
+func NewRequestID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return "request-" + hex.EncodeToString(random[:]), nil
+}
+
+// NewAuditID returns a cryptographically random audit event ID.
+func NewAuditID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return "admin-" + hex.EncodeToString(random[:]), nil
+}
+
 // Client sends a single authenticated request to a daemon-owned local socket.
 // Its zero value is not valid; construct it with NewClient.
 type Client struct {
 	requestTimeout time.Duration
+	clock          func() time.Time
+	newRequestID   func() (string, error)
 }
 
-// NewClient returns a client using the default bounded request timeout.
-func NewClient() *Client {
-	return &Client{requestTimeout: defaultRequestTimeout}
+// NewClient validates options and returns a client with explicit time and ID
+// dependencies.
+func NewClient(options ClientOptions) (*Client, error) {
+	if options.RequestTimeout <= 0 || options.Clock == nil || options.NewRequestID == nil {
+		return nil, ErrInvalidOptions
+	}
+	return &Client{
+		requestTimeout: options.RequestTimeout,
+		clock:          options.Clock,
+		newRequestID:   options.NewRequestID,
+	}, nil
+}
+
+// NewProductionClient returns a client assembled with the production clock
+// and random request ID generator.
+func NewProductionClient() (*Client, error) {
+	return NewClient(ClientOptions{
+		RequestTimeout: DefaultRequestTimeout,
+		Clock:          SystemClock,
+		NewRequestID:   NewRequestID,
+	})
 }
 
 // Status requests the safe bounded daemon status without opening local state.
@@ -96,10 +159,10 @@ func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, su
 }
 
 func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
-	if ctx == nil || c == nil || c.requestTimeout <= 0 || !validOperation(operation) || !validReasonCode(reasonCode) {
+	if ctx == nil || c == nil || c.requestTimeout <= 0 || c.clock == nil || c.newRequestID == nil || !validOperation(operation) || !validReasonCode(reasonCode) {
 		return response{}, nil, nil, nil, ErrInvalidOptions
 	}
-	requestID, err := newRequestID()
+	requestID, err := c.newRequestID()
 	if err != nil {
 		return response{}, nil, nil, nil, ErrDaemonUnavailable
 	}
@@ -168,7 +231,7 @@ func (c *Client) connect(ctx context.Context, socketPath string) (*net.UnixConn,
 		}
 		return nil, ErrSocketReplaced
 	}
-	deadline := time.Now().Add(c.requestTimeout)
+	deadline := c.clock().Add(c.requestTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
@@ -184,12 +247,4 @@ func transportError(ctx context.Context) error {
 		return err
 	}
 	return ErrDaemonUnavailable
-}
-
-func newRequestID() (string, error) {
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	return "request-" + hex.EncodeToString(random[:]), nil
 }

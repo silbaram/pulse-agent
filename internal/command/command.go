@@ -77,7 +77,7 @@ type configValidation struct {
 
 // Execute runs the requested command and returns its process exit code.
 func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return executeWithDependencies(ctx, args, stdout, stderr, standalone.New(), config.Load, adminipc.NewClient())
+	return executeWithProductionClient(ctx, args, stdout, stderr, standalone.New(), config.Load)
 }
 
 func execute(
@@ -87,7 +87,7 @@ func execute(
 	stderr io.Writer,
 	service standaloneRunner,
 ) int {
-	return executeWithDependencies(ctx, args, stdout, stderr, service, config.Load, adminipc.NewClient())
+	return executeWithProductionClient(ctx, args, stdout, stderr, service, config.Load)
 }
 
 func executeWithConfig(
@@ -98,7 +98,22 @@ func executeWithConfig(
 	service standaloneRunner,
 	loadConfig configLoader,
 ) int {
-	return executeWithDependencies(ctx, args, stdout, stderr, service, loadConfig, adminipc.NewClient())
+	return executeWithProductionClient(ctx, args, stdout, stderr, service, loadConfig)
+}
+
+func executeWithProductionClient(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	service standaloneRunner,
+	loadConfig configLoader,
+) int {
+	client, err := adminipc.NewProductionClient()
+	if err != nil {
+		return writeError(stderr, ExitFailure, "admin_client_unavailable", "", "administrative client initialization failed")
+	}
+	return executeWithDependencies(ctx, args, stdout, stderr, service, loadConfig, client)
 }
 
 func executeWithDependencies(

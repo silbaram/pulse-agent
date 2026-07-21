@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -19,6 +20,107 @@ import (
 )
 
 var authorizedTestActor = Actor{UID: 1000, GID: 1000}
+
+var errTestWrite = errors.New("test write failure")
+
+func TestClient_UsesInjectedRequestID(t *testing.T) {
+	state := openTestStore(t)
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	clock := time.Now()
+	client, err := NewClient(ClientOptions{
+		RequestTimeout: time.Second,
+		Clock:          func() time.Time { return clock },
+		NewRequestID: func() (string, error) {
+			return "request-test-fixed", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+
+	if _, err := client.Status(context.Background(), socketPath, "operator_status"); err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	if events[0].AggregateID != "request-request-test-fixed" {
+		t.Errorf("audit aggregate ID = %q, want injected request ID", events[0].AggregateID)
+	}
+	stop()
+}
+
+func TestServer_UsesInjectedClockAndAuditID(t *testing.T) {
+	state := openTestStore(t)
+	clock := time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
+	server, err := NewServer(Options{
+		SocketPath:      filepath.Join(t.TempDir(), "admin.sock"),
+		AllowedUIDs:     []uint32{authorizedTestActor.UID},
+		AllowedGIDs:     []uint32{authorizedTestActor.GID},
+		State:           state,
+		RequestTimeout:  time.Second,
+		PeerCredentials: func(*net.UnixConn) (Actor, error) { return authorizedTestActor, nil },
+		Clock:           func() time.Time { return clock },
+		NewAuditID: func() (string, error) {
+			return "admin-test-fixed", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	var destination bytes.Buffer
+	err = server.route(&destination, authorizedTestActor, Request{
+		SchemaVersion: SchemaVersion,
+		RequestID:     "request-test-fixed",
+		Operation:     OperationStatus,
+		ReasonCode:    "operator_status",
+	})
+	if err != nil {
+		t.Fatalf("route() error = %v", err)
+	}
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	if events[0].EventID != "admin-test-fixed" || !events[0].OccurredAt.Equal(clock) {
+		t.Errorf("audit event = %#v, want injected ID and clock", events[0])
+	}
+}
+
+func TestServer_RoutePropagatesStatusAndBackupWriteFailures(t *testing.T) {
+	state := openTestStore(t)
+	server := newTestServer(t, state, testSocketPath(t), time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	for _, request := range []Request{
+		{
+			SchemaVersion: SchemaVersion,
+			RequestID:     "request-status-write-failure",
+			Operation:     OperationStatus,
+			ReasonCode:    "operator_status",
+		},
+		{
+			SchemaVersion: SchemaVersion,
+			RequestID:     "request-backup-write-failure",
+			Operation:     OperationBackup,
+			ReasonCode:    "routine_backup",
+		},
+	} {
+		if err := server.route(failingWriter{}, authorizedTestActor, request); !errors.Is(err, errTestWrite) {
+			t.Errorf("route(%s) error = %v, want %v", request.Operation, err, errTestWrite)
+		}
+	}
+	events := readAuditEvents(t, state)
+	if len(events) != 2 {
+		t.Fatalf("audit event count = %d, want 2", len(events))
+	}
+	assertAuditEvent(t, events[0], auditActionStatus, auditResultAccepted, "operator_status")
+	assertAuditEvent(t, events[1], auditActionBackup, auditResultAccepted, "routine_backup")
+}
 
 func TestServer_StatusAndBackupAuditAuthenticatedActor(t *testing.T) {
 	state := openTestStore(t)
@@ -35,7 +137,7 @@ func TestServer_StatusAndBackupAuditAuthenticatedActor(t *testing.T) {
 	if !server.socketIsCurrent() {
 		t.Fatal("daemon socket did not retain its expected owner, group, and inode")
 	}
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 
 	status, err := client.Status(context.Background(), socketPath, "operator_status")
 	if err != nil {
@@ -84,7 +186,7 @@ func TestServer_RejectsUnauthorizedPeerAndAuditsRejection(t *testing.T) {
 	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
 		return unauthorized, nil
 	})
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 
 	_, err := client.Status(context.Background(), socketPath, "operator_status")
 	if !errors.Is(err, ErrRequestRejected) {
@@ -109,7 +211,6 @@ func TestServer_RejectsMalformedRequestBeforeRouting(t *testing.T) {
 		return authorizedTestActor, nil
 	})
 	connection := dialTestSocket(t, socketPath)
-	defer connection.Close()
 
 	if _, err := io.WriteString(connection, `{"schema_version":"v1","request_id":"request-1","operation":"status","reason_code":"operator_status","unexpected":true}`+"\n"); err != nil {
 		t.Fatalf("write malformed request: %v", err)
@@ -134,7 +235,7 @@ func TestServer_TargetRegisterUsesDaemonRegistryAndAuditsActor(t *testing.T) {
 	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
 		return authorizedTestActor, nil
 	}, registry)
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 
 	result, err := client.Register(context.Background(), socketPath, "onboarding", testServiceTarget())
 	if err != nil {
@@ -165,7 +266,7 @@ func TestServer_TargetRegisterRejectsUnauthorizedPeer(t *testing.T) {
 	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
 		return unauthorized, nil
 	}, registry)
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 
 	_, err := client.Register(context.Background(), socketPath, "onboarding", testServiceTarget())
 	if !errors.Is(err, ErrRequestRejected) {
@@ -183,7 +284,7 @@ func TestServer_TargetRegisterRejectsUnauthorizedPeer(t *testing.T) {
 }
 
 func TestClient_RejectsAbsentAndSymlinkSocket(t *testing.T) {
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 	socketPath := filepath.Join(t.TempDir(), "admin.sock")
 
 	_, err := client.Status(context.Background(), socketPath, "operator_status")
@@ -252,7 +353,7 @@ func TestServer_HandlesConcurrentRequestsAndGracefulShutdown(t *testing.T) {
 	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
 		return authorizedTestActor, nil
 	})
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 
 	const requestCount = 24
 	errorsByRequest := make(chan error, requestCount)
@@ -292,7 +393,6 @@ func TestServer_TimeoutAndCancellationCloseIncompleteConnections(t *testing.T) {
 	})
 
 	timeoutConnection := dialTestSocket(t, socketPath)
-	defer timeoutConnection.Close()
 	awaitSignal(t, accepted, "server did not accept timeout connection")
 	if err := timeoutConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set timeout connection read deadline: %v", err)
@@ -303,7 +403,6 @@ func TestServer_TimeoutAndCancellationCloseIncompleteConnections(t *testing.T) {
 	}
 
 	cancelConnection := dialTestSocket(t, socketPath)
-	defer cancelConnection.Close()
 	awaitSignal(t, accepted, "server did not accept cancellation connection")
 	if err := cancelConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set cancellation connection read deadline: %v", err)
@@ -323,7 +422,7 @@ func TestClient_ContextCancellationClosesPendingRequest(t *testing.T) {
 		<-releaseCredentials
 		return authorizedTestActor, nil
 	})
-	client := &Client{requestTimeout: time.Second}
+	client := newTestClient(t, time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -416,6 +515,7 @@ func newTestServer(t *testing.T, state *store.Store, socketPath string, timeout 
 
 func newTestServerWithTargets(t *testing.T, state *store.Store, socketPath string, timeout time.Duration, credentials PeerCredentials, registry *target.Registry) *Server {
 	t.Helper()
+	clock := time.Now()
 	server, err := NewServer(Options{
 		SocketPath:      socketPath,
 		AllowedUIDs:     []uint32{authorizedTestActor.UID},
@@ -424,6 +524,8 @@ func newTestServerWithTargets(t *testing.T, state *store.Store, socketPath strin
 		Targets:         registry,
 		RequestTimeout:  timeout,
 		PeerCredentials: credentials,
+		Clock:           func() time.Time { return clock },
+		NewAuditID:      newTestIDGenerator("admin-test"),
 	})
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
@@ -503,7 +605,43 @@ func dialTestSocket(t *testing.T, socketPath string) *net.UnixConn {
 	if err != nil {
 		t.Fatalf("DialUnix(%q) error = %v", socketPath, err)
 	}
+	t.Cleanup(func() {
+		if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("UnixConn.Close() error = %v", err)
+		}
+	})
 	return connection
+}
+
+func newTestClient(t *testing.T, timeout time.Duration) *Client {
+	t.Helper()
+	clock := time.Now()
+	client, err := NewClient(ClientOptions{
+		RequestTimeout: timeout,
+		Clock:          func() time.Time { return clock },
+		NewRequestID:   newTestIDGenerator("request-test"),
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	return client
+}
+
+func newTestIDGenerator(prefix string) func() (string, error) {
+	var mu sync.Mutex
+	sequence := 0
+	return func() (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		sequence++
+		return fmt.Sprintf("%s-%d", prefix, sequence), nil
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errTestWrite
 }
 
 func readTestResponse(t *testing.T, connection *net.UnixConn) response {

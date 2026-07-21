@@ -84,17 +84,14 @@ func listenSocket(path string, ownerUID, ownerGID uint32) (*net.UnixListener, os
 	}
 	listener.SetUnlinkOnClose(false)
 	if err := os.Chmod(path, socketMode); err != nil {
-		_ = listener.Close()
-		return nil, nil, ErrInsecureSocket
+		return nil, nil, errors.Join(ErrInsecureSocket, listener.Close())
 	}
 	if err := os.Chown(path, int(ownerUID), int(ownerGID)); err != nil {
-		_ = listener.Close()
-		return nil, nil, ErrInsecureSocket
+		return nil, nil, errors.Join(ErrInsecureSocket, listener.Close())
 	}
 	info, err := os.Lstat(path)
 	if err != nil || verifyDaemonSocket(info, ownerUID, ownerGID) != nil {
-		_ = listener.Close()
-		return nil, nil, ErrInsecureSocket
+		return nil, nil, errors.Join(ErrInsecureSocket, listener.Close())
 	}
 	return listener, info, nil
 }

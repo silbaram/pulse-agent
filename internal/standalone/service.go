@@ -106,6 +106,8 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 		AllowedGIDs: runtimeConfig.Admin.AllowedGIDs,
 		State:       state,
 		Targets:     registry,
+		Clock:       adminipc.SystemClock,
+		NewAuditID:  adminipc.NewAuditID,
 	})
 	if err != nil {
 		return fmt.Errorf("create administrative IPC server: %w", err)

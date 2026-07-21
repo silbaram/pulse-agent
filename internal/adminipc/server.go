@@ -3,9 +3,8 @@ package adminipc
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -18,8 +17,6 @@ import (
 )
 
 const (
-	defaultRequestTimeout = 5 * time.Second
-
 	auditAggregateType       = "admin_request"
 	auditActionRequest       = "admin.request"
 	auditActionStatus        = "admin.status"
@@ -60,6 +57,11 @@ type Options struct {
 	// PeerCredentials overrides the operating-system peer lookup for controlled
 	// tests. Production callers should leave it nil.
 	PeerCredentials PeerCredentials
+	// Clock returns the current time used for request deadlines and audit
+	// timestamps. It must be explicit to keep behavior deterministic in tests.
+	Clock func() time.Time
+	// NewAuditID returns one unique audit event ID for every recorded request.
+	NewAuditID func() (string, error)
 }
 
 // Server owns one protected Unix socket and routes authenticated administrative
@@ -74,6 +76,8 @@ type Server struct {
 	targets         *target.Registry
 	requestTimeout  time.Duration
 	peerCredentials PeerCredentials
+	clock           func() time.Time
+	newAuditID      func() (string, error)
 
 	mu          sync.Mutex
 	started     bool
@@ -84,12 +88,13 @@ type Server struct {
 	socketInfo  os.FileInfo
 	connections map[*net.UnixConn]struct{}
 	workers     sync.WaitGroup
+	workerErrs  []error
 }
 
 // NewServer validates options and returns a server that has not bound its
 // socket yet. Both UID and GID allowlists must match for a peer to be allowed.
 func NewServer(options Options) (*Server, error) {
-	if err := validateSocketPath(options.SocketPath); err != nil || options.State == nil {
+	if err := validateSocketPath(options.SocketPath); err != nil || options.State == nil || options.Clock == nil || options.NewAuditID == nil {
 		return nil, ErrInvalidOptions
 	}
 	allowedUIDs, ok := identitySet(options.AllowedUIDs)
@@ -126,6 +131,8 @@ func NewServer(options Options) (*Server, error) {
 		targets:         options.Targets,
 		requestTimeout:  timeout,
 		peerCredentials: peerCredentials,
+		clock:           options.Clock,
+		newAuditID:      options.NewAuditID,
 		connections:     make(map[*net.UnixConn]struct{}),
 		closeDone:       make(chan struct{}),
 	}, nil
@@ -141,20 +148,26 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 
+	var cancellationCloseErr error
+	var cancellationCloseMu sync.Mutex
 	stopClose := context.AfterFunc(ctx, func() {
-		_ = s.Close()
+		if err := s.Close(); err != nil {
+			cancellationCloseMu.Lock()
+			cancellationCloseErr = errors.Join(cancellationCloseErr, err)
+			cancellationCloseMu.Unlock()
+		}
 	})
 	defer stopClose()
 
 	listener, socketInfo, err := listenSocket(s.socketPath, s.ownerUID, s.ownerGID)
 	if err != nil {
-		_ = s.Close()
-		return err
+		return errors.Join(err, s.Close())
 	}
 	if !s.installListener(listener, socketInfo) {
-		_ = listener.Close()
-		_ = removeOwnedSocket(s.socketPath, socketInfo, s.ownerUID, s.ownerGID)
-		return nil
+		return errors.Join(
+			listener.Close(),
+			removeOwnedSocket(s.socketPath, socketInfo, s.ownerUID, s.ownerGID),
+		)
 	}
 
 	var serveErr error
@@ -168,20 +181,22 @@ func (s *Server) Serve(ctx context.Context) error {
 			break
 		}
 		if !s.socketIsCurrent() {
-			_ = connection.Close()
-			serveErr = ErrSocketReplaced
+			serveErr = errors.Join(ErrSocketReplaced, connection.Close())
 			break
 		}
 		if !s.trackConnection(connection) {
-			_ = connection.Close()
+			serveErr = errors.Join(serveErr, connection.Close())
 			break
 		}
 		go s.serveConnection(connection)
 	}
 
-	_ = s.Close()
+	closeErr := s.Close()
 	s.workers.Wait()
-	return serveErr
+	cancellationCloseMu.Lock()
+	deferredCloseErr := cancellationCloseErr
+	cancellationCloseMu.Unlock()
+	return errors.Join(serveErr, closeErr, deferredCloseErr, s.workerError())
 }
 
 // Close stops accepting work, cancels active connections, and removes the
@@ -274,55 +289,87 @@ func (s *Server) serveConnection(connection *net.UnixConn) {
 		s.mu.Lock()
 		delete(s.connections, connection)
 		s.mu.Unlock()
-		_ = connection.Close()
+		if err := connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.recordWorkerError(err)
+		}
 	}()
 
 	if !s.socketIsCurrent() {
 		return
 	}
-	if err := connection.SetDeadline(time.Now().Add(s.requestTimeout)); err != nil {
+	if err := connection.SetDeadline(s.clock().Add(s.requestTimeout)); err != nil {
 		return
 	}
 
 	actor, err := s.peerCredentials(connection)
 	if err != nil {
-		_ = writeMessage(connection, failureResponse("", errorAuthentication))
+		if err := writeMessage(connection, failureResponse("", errorAuthentication)); err != nil {
+			return
+		}
 		return
 	}
 	if !s.authorized(actor) {
-		if s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonUnauthorized) != nil {
+		if err := s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonUnauthorized); err != nil {
+			s.recordWorkerError(err)
 			return
 		}
-		_ = writeMessage(connection, failureResponse("", errorPermissionDenied))
+		if err := writeMessage(connection, failureResponse("", errorPermissionDenied)); err != nil {
+			return
+		}
 		return
 	}
 
 	reader := bufioReader(connection)
 	document, err := readMessage(reader)
 	if err != nil {
-		if s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonMalformed) == nil {
-			_ = writeMessage(connection, failureResponse("", errorMalformedRequest))
+		if err := s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonMalformed); err != nil {
+			s.recordWorkerError(err)
+			return
+		}
+		if err := writeMessage(connection, failureResponse("", errorMalformedRequest)); err != nil {
+			return
 		}
 		return
 	}
 	request, err := decodeRequest(document)
 	if err != nil {
-		if s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonMalformed) == nil {
-			_ = writeMessage(connection, failureResponse("", errorMalformedRequest))
+		if err := s.appendAudit(actor, "", auditActionRequest, auditResultRejected, auditReasonMalformed); err != nil {
+			s.recordWorkerError(err)
+			return
+		}
+		if err := writeMessage(connection, failureResponse("", errorMalformedRequest)); err != nil {
+			return
 		}
 		return
 	}
 
-	s.route(connection, actor, request)
+	if err := s.route(connection, actor, request); err != nil {
+		s.recordWorkerError(err)
+	}
 }
 
-func (s *Server) route(connection *net.UnixConn, actor Actor, request Request) {
+func (s *Server) recordWorkerError(err error) {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	s.mu.Lock()
+	s.workerErrs = append(s.workerErrs, err)
+	s.mu.Unlock()
+}
+
+func (s *Server) workerError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return errors.Join(s.workerErrs...)
+}
+
+func (s *Server) route(connection io.Writer, actor Actor, request Request) error {
 	switch request.Operation {
 	case OperationStatus:
-		if s.appendAudit(actor, request.RequestID, auditActionStatus, auditResultAccepted, request.ReasonCode) != nil {
-			return
+		if err := s.appendAudit(actor, request.RequestID, auditActionStatus, auditResultAccepted, request.ReasonCode); err != nil {
+			return err
 		}
-		_ = writeMessage(connection, response{
+		return writeMessage(connection, response{
 			SchemaVersion: SchemaVersion,
 			RequestID:     request.RequestID,
 			Result:        resultSuccess,
@@ -334,10 +381,10 @@ func (s *Server) route(connection *net.UnixConn, actor Actor, request Request) {
 			},
 		})
 	case OperationBackup:
-		if s.appendAudit(actor, request.RequestID, auditActionBackup, auditResultAccepted, request.ReasonCode) != nil {
-			return
+		if err := s.appendAudit(actor, request.RequestID, auditActionBackup, auditResultAccepted, request.ReasonCode); err != nil {
+			return err
 		}
-		_ = s.state.BackupWithSize(connection, func(size int64) error {
+		return s.state.BackupWithSize(connection, func(size int64) error {
 			return writeMessage(connection, response{
 				SchemaVersion: SchemaVersion,
 				RequestID:     request.RequestID,
@@ -347,12 +394,10 @@ func (s *Server) route(connection *net.UnixConn, actor Actor, request Request) {
 		})
 	case OperationTargetRegister:
 		if s.targets == nil || request.Target == nil {
-			if s.appendAudit(actor, request.RequestID, auditActionRequest, auditResultRejected, auditReasonUnsupported) == nil {
-				if err := writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected)); err != nil {
-					return
-				}
+			if err := s.appendAudit(actor, request.RequestID, auditActionRequest, auditResultRejected, auditReasonUnsupported); err != nil {
+				return err
 			}
-			return
+			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
 		}
 		snapshot, err := s.targets.Register(target.Registration{
 			Target:        *request.Target,
@@ -361,25 +406,21 @@ func (s *Server) route(connection *net.UnixConn, actor Actor, request Request) {
 			ReasonCode:    request.ReasonCode,
 		})
 		if err != nil {
-			if writeErr := writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected)); writeErr != nil {
-				return
-			}
-			return
+			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
 		}
 		result := target.RegistrationResult{
 			SchemaVersion: SchemaVersion,
 			Version:       snapshot.Version,
 			TargetID:      request.Target.TargetID,
 		}
-		if err := writeMessage(connection, response{
+		return writeMessage(connection, response{
 			SchemaVersion: SchemaVersion,
 			RequestID:     request.RequestID,
 			Result:        resultSuccess,
 			TargetResult:  &result,
-		}); err != nil {
-			return
-		}
+		})
 	}
+	return ErrMalformedRequest
 }
 
 func (s *Server) authorized(actor Actor) bool {
@@ -389,7 +430,7 @@ func (s *Server) authorized(actor Actor) bool {
 }
 
 func (s *Server) appendAudit(actor Actor, requestID, action, outcome, reason string) error {
-	eventID, err := newAuditID()
+	eventID, err := s.newAuditID()
 	if err != nil {
 		return err
 	}
@@ -403,7 +444,7 @@ func (s *Server) appendAudit(actor Actor, requestID, action, outcome, reason str
 			Action:        action,
 			Result:        outcome,
 			ReasonCode:    reason,
-			OccurredAt:    time.Now(),
+			OccurredAt:    s.clock(),
 		}, nil)
 		return err
 	})
@@ -430,14 +471,6 @@ func identitySet(identities []uint32) (map[uint32]struct{}, bool) {
 		set[identity] = struct{}{}
 	}
 	return set, true
-}
-
-func newAuditID() (string, error) {
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	return "admin-" + hex.EncodeToString(random[:]), nil
 }
 
 func auditAggregateID(requestID string) string {
