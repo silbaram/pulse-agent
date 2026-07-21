@@ -30,6 +30,7 @@ const (
 	phaseAwaitingApproval journalPhase = "awaiting_approval"
 	phaseApproved         journalPhase = "approved"
 	phaseExecuting        journalPhase = "executing"
+	phaseStabilizing      journalPhase = "stabilizing"
 	phaseCompleted        journalPhase = "completed"
 	phaseVerifyAndNotify  journalPhase = "verify_and_notify"
 )
@@ -153,11 +154,35 @@ func (c *Coordinator) startExecution(key string) (journalRecord, error) {
 }
 
 func (c *Coordinator) finishExecution(key string, next contract.RecoveryCommandState) (journalRecord, error) {
-	if next != contract.RecoverySucceeded && next != contract.RecoveryFailed {
+	if next != contract.RecoveryStabilizing && next != contract.RecoveryFailed {
 		return journalRecord{}, ErrInvalidRequest
 	}
 	return c.updateRecord(key, func(record *journalRecord) error {
 		if record.Phase != phaseExecuting || record.Command.State != contract.RecoveryExecuting {
+			return errCommandNotExecutable
+		}
+		if err := record.Command.State.ValidateTransition(next); err != nil {
+			return err
+		}
+		record.Command.State = next
+		if next == contract.RecoveryStabilizing {
+			record.Phase = phaseStabilizing
+		} else {
+			record.Phase = phaseCompleted
+		}
+		return nil
+	})
+}
+
+func (c *Coordinator) completeStabilization(key string, next contract.RecoveryCommandState) (journalRecord, error) {
+	if next != contract.RecoverySucceeded && next != contract.RecoveryFailed {
+		return journalRecord{}, ErrInvalidRequest
+	}
+	return c.updateRecord(key, func(record *journalRecord) error {
+		if record.Phase == phaseCompleted && record.Command.State == next {
+			return nil
+		}
+		if record.Phase != phaseStabilizing || record.Command.State != contract.RecoveryStabilizing {
 			return errCommandNotExecutable
 		}
 		if err := record.Command.State.ValidateTransition(next); err != nil {
@@ -313,6 +338,8 @@ func validRecordPhase(phase journalPhase, state contract.RecoveryCommandState) b
 		return state == contract.RecoveryApproved
 	case phaseExecuting:
 		return state == contract.RecoveryExecuting
+	case phaseStabilizing:
+		return state == contract.RecoveryStabilizing
 	case phaseCompleted:
 		return state == contract.RecoverySucceeded || state == contract.RecoveryFailed || state == contract.RecoveryDenied || state == contract.RecoveryExpired
 	case phaseVerifyAndNotify:

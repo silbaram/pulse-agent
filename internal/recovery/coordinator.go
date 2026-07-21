@@ -121,6 +121,8 @@ type Outcome string
 const (
 	// OutcomeExecuted identifies an adapter action that returned successfully.
 	OutcomeExecuted Outcome = "executed"
+	// OutcomeStabilizing identifies a command that now waits for post-recovery verification.
+	OutcomeStabilizing Outcome = "stabilizing"
 	// OutcomeDenied identifies an action rejected before adapter execution.
 	OutcomeDenied Outcome = "denied"
 	// OutcomeExpired identifies a command that expired before adapter execution.
@@ -384,11 +386,46 @@ func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result
 		}
 		return Result{Command: uncertain.Command, Outcome: OutcomeVerifyAndNotify, Decision: decision}, fmt.Errorf("execute recovery action: %w", err)
 	}
-	succeeded, err := c.finishExecution(recordKey(record.Command), contract.RecoverySucceeded)
+	stabilizing, err := c.finishExecution(recordKey(record.Command), contract.RecoveryStabilizing)
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Command: succeeded.Command, Outcome: OutcomeExecuted, Decision: decision}, nil
+	return Result{Command: stabilizing.Command, Outcome: OutcomeStabilizing, Decision: decision}, nil
+}
+
+// CompleteStabilization records the terminal result of a separate post-recovery
+// verifier. Repeating the same terminal result is idempotent so a verifier can
+// recover from a persistence failure without changing the recovery outcome.
+// A successful Docker API response alone cannot complete a command.
+func (c *Coordinator) CompleteStabilization(commandID string, succeeded bool) (contract.RecoveryCommand, error) {
+	if c == nil || !validToken(commandID, maxCommandIDLength) {
+		return contract.RecoveryCommand{}, ErrInvalidRequest
+	}
+	var stored storedRecord
+	found := false
+	err := c.state.View(func(transaction *store.Tx) error {
+		var findErr error
+		stored, found, findErr = findRecordByCommandID(transaction, commandID)
+		return findErr
+	})
+	if err != nil {
+		return contract.RecoveryCommand{}, fmt.Errorf("read recovery command: %w", err)
+	}
+	if !found {
+		return contract.RecoveryCommand{}, ErrInvalidRequest
+	}
+	next := contract.RecoveryFailed
+	if succeeded {
+		next = contract.RecoverySucceeded
+	}
+	if stored.record.Phase == phaseCompleted && stored.record.Command.State == next {
+		return stored.record.Command, nil
+	}
+	completed, err := c.completeStabilization(stored.key, next)
+	if err != nil {
+		return contract.RecoveryCommand{}, err
+	}
+	return completed.Command, nil
 }
 
 func (c *Coordinator) denyAfterRevalidation(record journalRecord, decision policy.Decision, cause error) (Result, error) {
@@ -452,6 +489,9 @@ func existingOutcome(record journalRecord) Outcome {
 	}
 	if record.Phase == phaseVerifyAndNotify {
 		return OutcomeVerifyAndNotify
+	}
+	if record.Phase == phaseStabilizing {
+		return OutcomeStabilizing
 	}
 	return OutcomeDuplicate
 }

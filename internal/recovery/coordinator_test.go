@@ -43,15 +43,15 @@ func TestCoordinator_SubmitPersistsPendingBeforeAdapterExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
-	if result.Outcome != OutcomeExecuted || result.Command.State != contract.RecoverySucceeded || !pendingObserved {
-		t.Fatalf("Submit() = %#v, pendingObserved=%t, want successful pending-first execution", result, pendingObserved)
+	if result.Outcome != OutcomeStabilizing || result.Command.State != contract.RecoveryStabilizing || !pendingObserved {
+		t.Fatalf("Submit() = %#v, pendingObserved=%t, want pending-first execution awaiting stabilization", result, pendingObserved)
 	}
 	if adapter.validateCalls != 1 || adapter.executeCalls != 1 {
 		t.Fatalf("adapter calls = validate=%d execute=%d, want 1 each", adapter.validateCalls, adapter.executeCalls)
 	}
 	stored := readRecord(t, state, result.Command)
-	if stored.Phase != phaseCompleted || stored.Command.State != contract.RecoverySucceeded {
-		t.Fatalf("stored command = phase=%q state=%q, want completed/succeeded", stored.Phase, stored.Command.State)
+	if stored.Phase != phaseStabilizing || stored.Command.State != contract.RecoveryStabilizing {
+		t.Fatalf("stored command = phase=%q state=%q, want stabilizing/stabilizing", stored.Phase, stored.Command.State)
 	}
 }
 
@@ -231,8 +231,8 @@ func TestCoordinator_DuplicateDeliveriesProduceAtMostOneEffect(t *testing.T) {
 	firstRequest := testRequest(now)
 
 	first, err := coordinator.Submit(context.Background(), firstRequest)
-	if err != nil || first.Outcome != OutcomeExecuted {
-		t.Fatalf("first Submit() = %#v, %v, want executed", first, err)
+	if err != nil || first.Outcome != OutcomeStabilizing {
+		t.Fatalf("first Submit() = %#v, %v, want stabilizing", first, err)
 	}
 	secondRequest := firstRequest
 	secondRequest.IdempotencyKey = "delivery-retry-2"
@@ -240,11 +240,36 @@ func TestCoordinator_DuplicateDeliveriesProduceAtMostOneEffect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Submit() error = %v", err)
 	}
-	if !second.Duplicate || second.Outcome != OutcomeDuplicate || second.Command.CommandID != first.Command.CommandID {
+	if !second.Duplicate || second.Outcome != OutcomeStabilizing || second.Command.CommandID != first.Command.CommandID {
 		t.Fatalf("second Submit() = %#v, want duplicate of %#v", second, first.Command)
 	}
 	if adapter.executeCalls != 1 {
 		t.Fatalf("Execute() calls = %d, want exactly one effect", adapter.executeCalls)
+	}
+}
+
+func TestCoordinator_CompleteStabilizationRequiresSeparateVerification(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}})
+
+	result, err := coordinator.Submit(context.Background(), testRequest(now))
+	if err != nil || result.Command.State != contract.RecoveryStabilizing {
+		t.Fatalf("Submit() = %#v, %v, want stabilizing command", result, err)
+	}
+	completed, err := coordinator.CompleteStabilization(result.Command.CommandID, true)
+	if err != nil {
+		t.Fatalf("CompleteStabilization() error = %v", err)
+	}
+	if completed.State != contract.RecoverySucceeded {
+		t.Fatalf("CompleteStabilization() state = %q, want succeeded", completed.State)
+	}
+	if repeated, err := coordinator.CompleteStabilization(result.Command.CommandID, true); err != nil || repeated.State != contract.RecoverySucceeded {
+		t.Fatalf("idempotent CompleteStabilization() = %#v, %v, want succeeded", repeated, err)
+	}
+	if _, err := coordinator.CompleteStabilization(result.Command.CommandID, false); !errors.Is(err, errCommandNotExecutable) {
+		t.Fatalf("opposite CompleteStabilization() error = %v, want errCommandNotExecutable", err)
 	}
 }
 

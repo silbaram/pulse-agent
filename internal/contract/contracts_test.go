@@ -50,7 +50,9 @@ func TestRecoveryCommandState_TransitionValidation(t *testing.T) {
 		want error
 	}{
 		{name: "pending to approved", from: RecoveryPending, to: RecoveryApproved},
-		{name: "executing to succeeded", from: RecoveryExecuting, to: RecoverySucceeded},
+		{name: "executing to stabilizing", from: RecoveryExecuting, to: RecoveryStabilizing},
+		{name: "stabilizing to succeeded", from: RecoveryStabilizing, to: RecoverySucceeded},
+		{name: "executing to succeeded", from: RecoveryExecuting, to: RecoverySucceeded, want: ErrInvalidStateTransition},
 		{name: "denied to executing", from: RecoveryDenied, to: RecoveryExecuting, want: ErrInvalidStateTransition},
 	}
 
