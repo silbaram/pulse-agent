@@ -12,6 +12,7 @@ import (
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/evidence"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -67,6 +68,8 @@ type Options struct {
 	Clock       Clock
 	MaxLogBytes int
 	Timeout     time.Duration
+	// Telemetry records bounded Docker action outcomes without exporting target IDs or errors.
+	Telemetry *telemetry.Recorder
 }
 
 // Snapshot is a bounded view of one Docker container's state and health.
@@ -83,6 +86,7 @@ type Adapter struct {
 	clock       Clock
 	maxLogBytes int
 	timeout     time.Duration
+	telemetry   *telemetry.Recorder
 
 	mu         sync.Mutex
 	negotiated bool
@@ -93,7 +97,7 @@ func NewAdapter(options Options) (*Adapter, error) {
 	if options.Client == nil || options.Evidence == nil || options.Clock == nil || options.MaxLogBytes < 1 || options.Timeout < time.Millisecond {
 		return nil, ErrInvalidOptions
 	}
-	return &Adapter{client: options.Client, evidence: options.Evidence, clock: options.Clock, maxLogBytes: options.MaxLogBytes, timeout: options.Timeout}, nil
+	return &Adapter{client: options.Client, evidence: options.Evidence, clock: options.Clock, maxLogBytes: options.MaxLogBytes, timeout: options.Timeout, telemetry: options.Telemetry}, nil
 }
 
 // Discover resolves a target to exactly one Docker container and returns its bounded state.
@@ -158,8 +162,10 @@ func (a *Adapter) CollectEvidence(ctx context.Context, target contract.ServiceTa
 // ValidateAction checks an exact target selector and safe restart preconditions.
 // A running unhealthy container is eligible: health is the recovery trigger,
 // while post-restart health belongs to the stabilization verifier.
-func (a *Adapter) ValidateAction(ctx context.Context, target contract.ServiceTarget, action contract.TypedAction) error {
-	_, err := a.validatedContainer(ctx, target, action)
+func (a *Adapter) ValidateAction(ctx context.Context, target contract.ServiceTarget, action contract.TypedAction) (err error) {
+	startedAt := time.Now()
+	defer func() { a.recordAction(ctx, telemetry.OperationValidate, startedAt, err) }()
+	_, err = a.validatedContainer(ctx, target, action)
 	return err
 }
 
@@ -178,7 +184,9 @@ func (a *Adapter) validatedContainer(ctx context.Context, target contract.Servic
 }
 
 // Execute validates then performs only the approved SDK restart operation.
-func (a *Adapter) Execute(ctx context.Context, target contract.ServiceTarget, action contract.TypedAction) error {
+func (a *Adapter) Execute(ctx context.Context, target contract.ServiceTarget, action contract.TypedAction) (err error) {
+	startedAt := time.Now()
+	defer func() { a.recordAction(ctx, telemetry.OperationExecute, startedAt, err) }()
 	container, err := a.validatedContainer(ctx, target, action)
 	if err != nil {
 		return err
@@ -189,6 +197,29 @@ func (a *Adapter) Execute(ctx context.Context, target contract.ServiceTarget, ac
 		return a.mapError(requestCtx, err)
 	}
 	return nil
+}
+
+func (a *Adapter) recordAction(ctx context.Context, operation telemetry.Operation, startedAt time.Time, actionErr error) {
+	if a == nil || a.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if actionErr != nil {
+		switch {
+		case errors.Is(actionErr, ErrInvalidTarget), errors.Is(actionErr, ErrAmbiguousTarget), errors.Is(actionErr, ErrPrecondition), errors.Is(actionErr, ErrUnsafeAction):
+			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(actionErr, ErrTimeout), errors.Is(actionErr, context.DeadlineExceeded):
+			result, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(actionErr, context.Canceled):
+			result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		default:
+			result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		}
+	}
+	event, err := telemetry.NewEventWithDimensions(telemetry.ComponentDocker, operation, result, reason, time.Since(startedAt), telemetry.Dimensions{Target: telemetry.TargetDocker})
+	if err == nil {
+		a.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 // Verify confirms bounded Docker state after a recovery action.

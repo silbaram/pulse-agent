@@ -12,6 +12,7 @@ import (
 	"pulse-agent/internal/docker"
 	"pulse-agent/internal/policy"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -98,6 +99,8 @@ type Options struct {
 	// LifecyclePublisher records durable events before recovery advances. Nil
 	// preserves the coordinator-only embedding used before notification wiring.
 	LifecyclePublisher LifecyclePublisher
+	// Telemetry records bounded policy and recovery outcomes after they are durable.
+	Telemetry *telemetry.Recorder
 }
 
 // Coordinator persists a recovery command before invoking a Docker adapter.
@@ -109,6 +112,7 @@ type Coordinator struct {
 	clock        Clock
 	newCommandID func() (string, error)
 	publisher    LifecyclePublisher
+	telemetry    *telemetry.Recorder
 }
 
 // Request is the current local authorization context for one recovery effect.
@@ -188,13 +192,16 @@ func New(options Options) (*Coordinator, error) {
 		clock:        options.Clock,
 		newCommandID: options.NewCommandID,
 		publisher:    options.LifecyclePublisher,
+		telemetry:    options.Telemetry,
 	}, nil
 }
 
 // Submit records a policy-permitted command before executing it. Duplicate
 // deliveries never invoke Adapter.Execute. A policy denial is a normal result;
 // adapter and store failures are returned as errors after durable state is updated.
-func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, error) {
+func (c *Coordinator) Submit(ctx context.Context, request Request) (result Result, err error) {
+	startedAt := time.Now()
+	defer func() { c.recordRecovery(ctx, telemetry.OperationExecute, startedAt, result, err) }()
 	if c == nil || ctx == nil {
 		return Result{}, ErrInvalidRequest
 	}
@@ -214,7 +221,7 @@ func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, erro
 		}
 	}
 
-	record, duplicate, decision, err := c.prepare(request, now)
+	record, duplicate, decision, err := c.prepare(ctx, request, now)
 	if err != nil {
 		return Result{}, err
 	}
@@ -252,7 +259,9 @@ func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, erro
 // Reconcile reads interrupted executable commands after process restart. It
 // never calls Adapter.Execute: every unresolved command is retained in the
 // verify_and_notify phase even when Docker state cannot be read.
-func (c *Coordinator) Reconcile(ctx context.Context) ([]ReconciliationResult, error) {
+func (c *Coordinator) Reconcile(ctx context.Context) (results []ReconciliationResult, err error) {
+	startedAt := time.Now()
+	defer func() { c.recordReconciliation(ctx, startedAt, results, err) }()
 	if c == nil || ctx == nil {
 		return nil, ErrInvalidRequest
 	}
@@ -260,7 +269,7 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]ReconciliationResult, er
 	if err != nil {
 		return nil, err
 	}
-	results := make([]ReconciliationResult, 0, len(records))
+	results = make([]ReconciliationResult, 0, len(records))
 	for _, stored := range records {
 		now, err := c.now()
 		if err != nil {
@@ -291,13 +300,15 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]ReconciliationResult, er
 // Resume executes one locally granted command after loading the current
 // daemon-owned state. A command without a durable local grant remains in the
 // approval wait state and never reaches the Docker adapter.
-func (c *Coordinator) Resume(ctx context.Context, commandID string) (Result, error) {
+func (c *Coordinator) Resume(ctx context.Context, commandID string) (result Result, err error) {
+	startedAt := time.Now()
+	defer func() { c.recordRecovery(ctx, telemetry.OperationExecute, startedAt, result, err) }()
 	if c == nil || ctx == nil || !validToken(commandID, maxCommandIDLength) {
 		return Result{}, ErrInvalidRequest
 	}
 	var stored storedRecord
 	found := false
-	err := c.state.View(func(transaction *store.Tx) error {
+	err = c.state.View(func(transaction *store.Tx) error {
 		var err error
 		stored, found, err = findRecordByCommandID(transaction, commandID)
 		return err
@@ -317,7 +328,7 @@ func (c *Coordinator) Resume(ctx context.Context, commandID string) (Result, err
 	return Result{Command: stored.record.Command, Outcome: existingOutcome(stored.record), Duplicate: true}, nil
 }
 
-func (c *Coordinator) prepare(request Request, now time.Time) (journalRecord, bool, policy.Decision, error) {
+func (c *Coordinator) prepare(ctx context.Context, request Request, now time.Time) (journalRecord, bool, policy.Decision, error) {
 	commandID, err := c.newCommandID()
 	if err != nil {
 		return journalRecord{}, false, policy.Decision{}, fmt.Errorf("create recovery command ID: %w", err)
@@ -326,7 +337,9 @@ func (c *Coordinator) prepare(request Request, now time.Time) (journalRecord, bo
 		return journalRecord{}, false, policy.Decision{}, ErrInvalidOptions
 	}
 	input := policyInput(request.PolicyInput, commandID, now)
+	decisionStartedAt := time.Now()
 	decision := policy.Evaluate(request.PolicySnapshot, input)
+	c.recordPolicy(ctx, decision, time.Since(decisionStartedAt))
 	if decision.Verdict == policy.VerdictDeny {
 		return journalRecord{}, false, decision, nil
 	}
@@ -526,7 +539,84 @@ func (c *Coordinator) revalidate(ctx context.Context, record journalRecord) (pol
 	if !now.Before(record.Command.ExpiresAt) {
 		return policy.Decision{}, now, true, nil
 	}
-	return revalidateState(state, record, now), now, false, nil
+	decisionStartedAt := time.Now()
+	decision := revalidateState(state, record, now)
+	c.recordPolicy(ctx, decision, time.Since(decisionStartedAt))
+	return decision, now, false, nil
+}
+
+func (c *Coordinator) recordPolicy(ctx context.Context, decision policy.Decision, duration time.Duration) {
+	if c == nil || c.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultRejected, telemetry.ReasonDenied
+	switch decision.Verdict {
+	case policy.VerdictAllow:
+		result, reason = telemetry.ResultSuccess, telemetry.ReasonAllowed
+	case policy.VerdictAwaitApproval:
+		result, reason = telemetry.ResultSuccess, telemetry.ReasonApprovalRequired
+	}
+	event, err := telemetry.NewEvent(telemetry.ComponentPolicy, telemetry.OperationDecide, result, reason, duration)
+	if err == nil {
+		c.telemetry.RecordBestEffort(ctx, event)
+	}
+}
+
+func (c *Coordinator) recordRecovery(ctx context.Context, operation telemetry.Operation, startedAt time.Time, result Result, operationErr error) {
+	if c == nil || c.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if operationErr != nil {
+		switch {
+		case errors.Is(operationErr, ErrInvalidRequest):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(operationErr, context.DeadlineExceeded):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(operationErr, context.Canceled):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		default:
+			telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	} else {
+		switch result.Outcome {
+		case OutcomeDenied:
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonDenied
+		case OutcomeExpired:
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonExpired
+		case OutcomeAwaitApproval:
+			reason = telemetry.ReasonApprovalRequired
+		case OutcomeDuplicate:
+			reason = telemetry.ReasonDuplicate
+		case OutcomeVerifyAndNotify:
+			reason = telemetry.ReasonUnavailable
+		}
+	}
+	event, err := telemetry.NewEvent(telemetry.ComponentRecovery, operation, telemetryResult, reason, time.Since(startedAt))
+	if err == nil {
+		c.telemetry.RecordBestEffort(ctx, event)
+	}
+}
+
+func (c *Coordinator) recordReconciliation(ctx context.Context, startedAt time.Time, results []ReconciliationResult, operationErr error) {
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if operationErr != nil {
+		result, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+	} else {
+		for _, reconciliation := range results {
+			if !reconciliation.Verified {
+				result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+				break
+			}
+		}
+	}
+	if c == nil || c.telemetry == nil {
+		return
+	}
+	event, err := telemetry.NewEvent(telemetry.ComponentRecovery, telemetry.OperationReconcile, result, reason, time.Since(startedAt))
+	if err == nil {
+		c.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 func revalidateState(state ExecutionState, record journalRecord, now time.Time) policy.Decision {

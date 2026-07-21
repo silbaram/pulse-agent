@@ -81,6 +81,20 @@ const (
 	ComponentEvidence Component = "evidence"
 	// ComponentAnalysis identifies bounded ADK analysis work.
 	ComponentAnalysis Component = "analysis"
+	// ComponentPolicy identifies deterministic recovery authorization decisions.
+	ComponentPolicy Component = "policy"
+	// ComponentDocker identifies bounded Docker Engine actions.
+	ComponentDocker Component = "docker"
+	// ComponentRecovery identifies durable recovery command coordination.
+	ComponentRecovery Component = "recovery"
+	// ComponentApproval identifies local administrative approval decisions.
+	ComponentApproval Component = "approval"
+	// ComponentStabilization identifies post-recovery verification work.
+	ComponentStabilization Component = "stabilization"
+	// ComponentDelivery identifies durable outbound webhook delivery work.
+	ComponentDelivery Component = "delivery"
+	// ComponentReport identifies terminal incident report publication.
+	ComponentReport Component = "report"
 )
 
 // Operation identifies one stable unit of component work. Values are
@@ -106,6 +120,18 @@ const (
 	OperationRedact Operation = "redact"
 	// OperationAnalyze identifies one bounded analysis graph run.
 	OperationAnalyze Operation = "analyze"
+	// OperationDecide identifies a deterministic authorization or approval decision.
+	OperationDecide Operation = "decide"
+	// OperationExecute identifies one bounded external action.
+	OperationExecute Operation = "execute"
+	// OperationReconcile identifies durable command reconciliation after restart.
+	OperationReconcile Operation = "reconcile"
+	// OperationVerify identifies post-action stabilization verification.
+	OperationVerify Operation = "verify"
+	// OperationDeliver identifies one outbound queue delivery attempt.
+	OperationDeliver Operation = "deliver"
+	// OperationPublish identifies durable report publication.
+	OperationPublish Operation = "publish"
 )
 
 // Result identifies the stable result classification of an operation.
@@ -143,6 +169,22 @@ const (
 	ReasonUnavailable Reason = "unavailable"
 	// ReasonInternal identifies an internal failure without exposing raw detail.
 	ReasonInternal Reason = "internal"
+	// ReasonAllowed identifies a successful deterministic authorization decision.
+	ReasonAllowed Reason = "allowed"
+	// ReasonDenied identifies a deterministic authorization or approval denial.
+	ReasonDenied Reason = "denied"
+	// ReasonApprovalRequired identifies a command waiting for local approval.
+	ReasonApprovalRequired Reason = "approval_required"
+	// ReasonConflict identifies a duplicate or incompatible durable operation.
+	ReasonConflict Reason = "conflict"
+	// ReasonExpired identifies an operation outside its configured lifetime.
+	ReasonExpired Reason = "expired"
+	// ReasonRetry identifies a durable retry outcome.
+	ReasonRetry Reason = "retry"
+	// ReasonUnhealthy identifies a bounded post-action health failure.
+	ReasonUnhealthy Reason = "unhealthy"
+	// ReasonPayload identifies unavailable or invalid typed delivery payload data.
+	ReasonPayload Reason = "payload"
 )
 
 // Target identifies a bounded monitored-target implementation kind.
@@ -419,7 +461,7 @@ func (e Event) attributes() []attribute.KeyValue {
 
 func validComponent(value Component) bool {
 	switch value {
-	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook, ComponentObserver, ComponentAlert, ComponentCorrelator, ComponentEvidence, ComponentAnalysis:
+	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook, ComponentObserver, ComponentAlert, ComponentCorrelator, ComponentEvidence, ComponentAnalysis, ComponentPolicy, ComponentDocker, ComponentRecovery, ComponentApproval, ComponentStabilization, ComponentDelivery, ComponentReport:
 		return true
 	default:
 		return false
@@ -428,7 +470,7 @@ func validComponent(value Component) bool {
 
 func validOperation(value Operation) bool {
 	switch value {
-	case OperationRead, OperationWrite, OperationRegister, OperationRequest, OperationBackup, OperationValidate, OperationTransition, OperationRedact, OperationAnalyze:
+	case OperationRead, OperationWrite, OperationRegister, OperationRequest, OperationBackup, OperationValidate, OperationTransition, OperationRedact, OperationAnalyze, OperationDecide, OperationExecute, OperationReconcile, OperationVerify, OperationDeliver, OperationPublish:
 		return true
 	default:
 		return false
@@ -452,7 +494,7 @@ func validResult(value Result) bool {
 
 func validReason(value Reason) bool {
 	switch value {
-	case ReasonNone, ReasonAccepted, ReasonDuplicate, ReasonInvalid, ReasonUnauthorized, ReasonTimeout, ReasonUnavailable, ReasonInternal:
+	case ReasonNone, ReasonAccepted, ReasonDuplicate, ReasonInvalid, ReasonUnauthorized, ReasonTimeout, ReasonUnavailable, ReasonInternal, ReasonAllowed, ReasonDenied, ReasonApprovalRequired, ReasonConflict, ReasonExpired, ReasonRetry, ReasonUnhealthy, ReasonPayload:
 		return true
 	default:
 		return false

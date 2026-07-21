@@ -12,6 +12,9 @@ import (
 	"pulse-agent/internal/docker"
 	"pulse-agent/internal/policy"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestCoordinator_SubmitPersistsPendingBeforeAdapterExecution(t *testing.T) {
@@ -52,6 +55,54 @@ func TestCoordinator_SubmitPersistsPendingBeforeAdapterExecution(t *testing.T) {
 	stored := readRecord(t, state, result.Command)
 	if stored.Phase != phaseStabilizing || stored.Command.State != contract.RecoveryStabilizing {
 		t.Fatalf("stored command = phase=%q state=%q, want stabilizing/stabilizing", stored.Phase, stored.Command.State)
+	}
+}
+
+func TestCoordinator_EmitsBoundedPolicyAndReconciliationTelemetry(t *testing.T) {
+	now := testNow()
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = recorder.Shutdown(context.Background()) })
+	state := openState(t)
+	adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+	request := testRequest(now)
+	request.IncidentID = "incident-raw-secret"
+	request.PolicyInput.RunbookDigest = "digest-raw-secret"
+	request.PolicySnapshot.Runbooks[0].Runbook.Digest = request.PolicyInput.RunbookDigest
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}}, &fakeStateSource{state: executionState(request)})
+	coordinator.telemetry = recorder
+	if _, err := coordinator.Submit(context.Background(), request); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if _, err := coordinator.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("telemetry flush error = %v", err)
+	}
+	seen := make(map[string]map[string]string)
+	for _, span := range spanExporter.GetSpans() {
+		attributes := make(map[string]string, len(span.Attributes))
+		for _, value := range span.Attributes {
+			attributes[string(value.Key)] = value.Value.AsString()
+		}
+		seen[span.Name] = attributes
+		for _, value := range attributes {
+			if value == "incident-raw-secret" || value == "digest-raw-secret" || value == "command-1" {
+				t.Fatalf("telemetry leaked recovery identifier: %s %#v", span.Name, attributes)
+			}
+		}
+	}
+	for _, name := range []string{"pulse.agent.policy.decide", "pulse.agent.recovery.execute", "pulse.agent.recovery.reconcile"} {
+		if _, found := seen[name]; !found {
+			t.Fatalf("telemetry spans = %#v, want %q", seen, name)
+		}
+	}
+	if seen["pulse.agent.policy.decide"][telemetry.AttributeReason] != string(telemetry.ReasonAllowed) {
+		t.Fatalf("policy telemetry = %#v, want bounded allowed reason", seen["pulse.agent.policy.decide"])
 	}
 }
 
@@ -472,7 +523,7 @@ func TestCoordinator_ReconcileProcessStopsWithoutRepeatingEffect(t *testing.T) {
 			adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
 			coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
 			request := testRequest(now)
-			record, duplicate, decision, err := coordinator.prepare(request, now)
+			record, duplicate, decision, err := coordinator.prepare(context.Background(), request, now)
 			if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
 				t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
 			}
@@ -502,7 +553,7 @@ func TestCoordinator_ReconcileVerificationFailureStaysFailClosed(t *testing.T) {
 	state := openState(t)
 	adapter := &fakeAdapter{verifyErr: errors.New("docker unavailable")}
 	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
-	record, duplicate, decision, err := coordinator.prepare(testRequest(now), now)
+	record, duplicate, decision, err := coordinator.prepare(context.Background(), testRequest(now), now)
 	if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
 		t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
 	}

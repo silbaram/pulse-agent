@@ -12,6 +12,9 @@ import (
 	"pulse-agent/internal/docker"
 	"pulse-agent/internal/policy"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestVerifier_SucceedsOnlyAfterSamplesAndWindow(t *testing.T) {
@@ -45,6 +48,45 @@ func TestVerifier_SucceedsOnlyAfterSamplesAndWindow(t *testing.T) {
 	result, err := verifier.Verify(context.Background(), request)
 	if err != nil || result.Outcome != OutcomeSucceeded || probe.calls != 3 || finalizer.calls != 1 {
 		t.Fatalf("idempotent Verify() = %#v, %v, probe=%d finalizer=%d, want persisted success without another probe", result, err, probe.calls, finalizer.calls)
+	}
+}
+
+func TestVerifier_EmitsBoundedStabilizationTelemetry(t *testing.T) {
+	now := testNow()
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = recorder.Shutdown(context.Background()) })
+	verifier := newVerifier(t, &fakeClock{times: []time.Time{now}}, &fakeProbe{samples: []Sample{{Healthy: true, Metrics: map[string]float64{"availability": 1}}}}, &fakeFinalizer{}, &fakeRetryState{state: retryState(now)})
+	verifier.telemetry = recorder
+	request := testRequest(now, 0)
+	request.Command.CommandID = "command-raw-secret"
+	request.Command.IncidentID = "incident-raw-secret"
+	request.Target.TargetID = request.Command.TargetID
+	result, err := verifier.Verify(context.Background(), request)
+	if err != nil || result.Outcome != OutcomePending {
+		t.Fatalf("Verify() = %#v, %v, want pending sample", result, err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("telemetry flush error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.stabilization.verify" {
+		t.Fatalf("telemetry spans = %#v, want stabilization verify span", spans)
+	}
+	attributes := make(map[string]string, len(spans[0].Attributes))
+	for _, value := range spans[0].Attributes {
+		attributes[string(value.Key)] = value.Value.AsString()
+	}
+	if attributes[telemetry.AttributeTarget] != string(telemetry.TargetDocker) || attributes[telemetry.AttributeResult] != string(telemetry.ResultSuccess) {
+		t.Fatalf("telemetry attributes = %#v, want bounded stabilization contract", attributes)
+	}
+	for _, value := range attributes {
+		if value == "command-raw-secret" || value == "incident-raw-secret" || value == "target-web" {
+			t.Fatalf("telemetry leaked stabilization identifier: %#v", attributes)
+		}
 	}
 }
 

@@ -13,6 +13,9 @@ import (
 	"pulse-agent/internal/docker"
 	"pulse-agent/internal/policy"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 const approvalTestActor = "uid:1000/gid:1000"
@@ -89,6 +92,37 @@ func TestApprovalManager_ExpiredDecisionExpiresWaitingCommand(t *testing.T) {
 	stored := readRecord(t, state, command)
 	if stored.Phase != phaseCompleted || stored.Command.State != contract.RecoveryExpired || adapter.executeCalls != 0 {
 		t.Fatalf("stored command = %#v, execute calls=%d, want expired with no execution", stored, adapter.executeCalls)
+	}
+}
+
+func TestApprovalManager_EmitsBoundedApprovalTelemetry(t *testing.T) {
+	now := testNow()
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = recorder.Shutdown(context.Background()) })
+	state := openState(t)
+	manager := newApprovalManager(t, state, ClockFunc(func() time.Time { return now }))
+	manager.telemetry = recorder
+	command, _, _ := waitingApprovalCommand(t, state, manager, now)
+	if _, err := manager.Decide(ApprovalDecisionRequest{
+		CommandID: command.CommandID, Decision: contract.ApprovalGranted, ActorIdentity: approvalTestActor, RequestID: "request-raw-secret", ReasonCode: "operator_requested", ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("Decide(grant) error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("telemetry flush error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.approval.decide" {
+		t.Fatalf("telemetry spans = %#v, want one approval decision span", spans)
+	}
+	for _, value := range spans[0].Attributes {
+		if text := value.Value.AsString(); text == command.CommandID || text == approvalTestActor || text == "request-raw-secret" {
+			t.Fatalf("telemetry leaked approval identity: %#v", spans[0].Attributes)
+		}
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"pulse-agent/internal/docker"
 	"pulse-agent/internal/policy"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -125,6 +126,8 @@ type Options struct {
 	Finalizer CommandFinalizer
 	// RetryState reloads current policy facts before recording a retry schedule.
 	RetryState RetryStateSource
+	// Telemetry records bounded verification outcomes after durable state updates.
+	Telemetry *telemetry.Recorder
 }
 
 // Verifier accumulates bounded post-recovery samples. Its zero value is invalid.
@@ -134,6 +137,7 @@ type Verifier struct {
 	clock      Clock
 	finalizer  CommandFinalizer
 	retryState RetryStateSource
+	telemetry  *telemetry.Recorder
 }
 
 // Request identifies one stabilization attempt. Attempt is zero based and is
@@ -193,13 +197,15 @@ func New(options Options) (*Verifier, error) {
 	if options.State == nil || options.Probe == nil || options.Clock == nil || options.Finalizer == nil || options.RetryState == nil {
 		return nil, ErrInvalidOptions
 	}
-	return &Verifier{state: options.State, probe: options.Probe, clock: options.Clock, finalizer: options.Finalizer, retryState: options.RetryState}, nil
+	return &Verifier{state: options.State, probe: options.Probe, clock: options.Clock, finalizer: options.Finalizer, retryState: options.RetryState, telemetry: options.Telemetry}, nil
 }
 
 // Verify records one stabilization sample. Callers control the scheduling cadence;
 // this method never sleeps or executes Docker operations. A command completes only
 // after the required consecutive samples and the full stabilization window pass.
-func (v *Verifier) Verify(ctx context.Context, request Request) (Result, error) {
+func (v *Verifier) Verify(ctx context.Context, request Request) (result Result, err error) {
+	startedAt := time.Now()
+	defer func() { v.recordVerification(ctx, request, startedAt, result, err) }()
 	if v == nil || ctx == nil || validateRequest(request) != nil {
 		return Result{}, ErrInvalidRequest
 	}
@@ -263,6 +269,48 @@ func (v *Verifier) Verify(ctx context.Context, request Request) (Result, error) 
 		return Result{}, err
 	}
 	return record.result(), nil
+}
+
+func (v *Verifier) recordVerification(ctx context.Context, request Request, startedAt time.Time, result Result, verificationErr error) {
+	if v == nil || v.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if verificationErr != nil {
+		switch {
+		case errors.Is(verificationErr, ErrInvalidRequest):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(verificationErr, context.DeadlineExceeded):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(verificationErr, context.Canceled):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		default:
+			telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	} else {
+		switch result.Outcome {
+		case OutcomeRetryScheduled:
+			reason = telemetry.ReasonRetry
+		case OutcomeFailed:
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInternal
+			switch result.FailureReason {
+			case FailureTimeout:
+				reason = telemetry.ReasonTimeout
+			case FailureUnhealthy, FailureFlapping, FailureMetricRegression:
+				reason = telemetry.ReasonUnhealthy
+			case FailureDockerUnavailable:
+				telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+			}
+		}
+	}
+	dimensions := telemetry.Dimensions{}
+	if target, ok := telemetry.TargetForAdapter(request.Target.AdapterType); ok {
+		dimensions.Target = target
+	}
+	event, eventErr := telemetry.NewEventWithDimensions(telemetry.ComponentStabilization, telemetry.OperationVerify, telemetryResult, reason, time.Since(startedAt), dimensions)
+	if eventErr == nil {
+		v.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 func (v *Verifier) fail(ctx context.Context, request Request, record resultRecord, now time.Time, reason FailureReason) (Result, error) {

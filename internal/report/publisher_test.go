@@ -16,7 +16,10 @@ import (
 	"pulse-agent/internal/delivery"
 	"pulse-agent/internal/lifecycle"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 	"pulse-agent/internal/webhook"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 const webhookSecret = "whsec_MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
@@ -109,6 +112,53 @@ func TestPublisher_RejectsSecretBearingTerminalInputWithoutPersistingPayload(t *
 	}
 }
 
+func TestPublisherAndDelivery_EmitBoundedTelemetryWithoutSecretFixture(t *testing.T) {
+	now := testNow()
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = recorder.Shutdown(context.Background()) })
+	publisher, _, _, dispatcher, _ := newPublisher(t, now, acceptClient{}, 8, 2, recorder)
+	input := completeInput(now, contract.IncidentClosed)
+	input.IncidentID = "incident-raw-secret"
+	input.Analysis.IncidentID = input.IncidentID
+	result, err := publisher.PublishTerminal(context.Background(), input)
+	if err != nil {
+		t.Fatalf("PublishTerminal() error = %v", err)
+	}
+	if _, err := dispatcher.DeliverDue(context.Background()); err != nil {
+		t.Fatalf("DeliverDue() error = %v", err)
+	}
+	secretInput := completeInput(now, contract.IncidentClosed)
+	secretInput.IdempotencyKey = "terminal-secret-fixture"
+	secretInput.Analysis.Hypotheses[0].Summary = "token=raw-secret"
+	if _, err := publisher.PublishTerminal(context.Background(), secretInput); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("PublishTerminal(secret fixture) error = %v, want %v", err, ErrInvalidInput)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("telemetry flush error = %v", err)
+	}
+	seen := make(map[string]struct{})
+	for _, span := range spanExporter.GetSpans() {
+		seen[span.Name] = struct{}{}
+		for _, value := range span.Attributes {
+			if strings.Contains(value.Value.AsString(), "raw-secret") || strings.Contains(value.Value.AsString(), "terminal-secret-fixture") {
+				t.Fatalf("telemetry leaked secret fixture: %s %#v", span.Name, span.Attributes)
+			}
+		}
+	}
+	for _, name := range []string{"pulse.agent.report.publish", "pulse.agent.delivery.write", "pulse.agent.delivery.deliver"} {
+		if _, found := seen[name]; !found {
+			t.Fatalf("telemetry spans = %#v, want %q", seen, name)
+		}
+	}
+	if result.Report.ReportID == "" {
+		t.Fatal("PublishTerminal() returned an empty report ID")
+	}
+}
+
 func completeInput(now time.Time, terminalState contract.IncidentState) Input {
 	verification := "stabilized"
 	if terminalState == contract.IncidentFailed {
@@ -142,8 +192,15 @@ func completeInput(now time.Time, terminalState contract.IncidentState) Input {
 	}
 }
 
-func newPublisher(t *testing.T, now time.Time, client delivery.HTTPClient, queueLimit, attempts int) (*Publisher, *Source, *lifecycle.Source, *delivery.Dispatcher, *captureClient) {
+func newPublisher(t *testing.T, now time.Time, client delivery.HTTPClient, queueLimit, attempts int, recorders ...*telemetry.Recorder) (*Publisher, *Source, *lifecycle.Source, *delivery.Dispatcher, *captureClient) {
 	t.Helper()
+	if len(recorders) > 1 {
+		t.Fatalf("newPublisher() received %d telemetry recorders, want at most 1", len(recorders))
+	}
+	var recorder *telemetry.Recorder
+	if len(recorders) == 1 {
+		recorder = recorders[0]
+	}
 	state, err := store.Open(store.Options{Path: filepath.Join(t.TempDir(), "state.db"), LockTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
@@ -190,6 +247,7 @@ func newPublisher(t *testing.T, now time.Time, client delivery.HTTPClient, queue
 		MaxBackoff:      time.Second,
 		RequestTimeout:  time.Second,
 		MaxPayloadBytes: 64 * 1024,
+		Telemetry:       recorder,
 	})
 	if err != nil {
 		t.Fatalf("delivery.New() error = %v", err)
@@ -198,7 +256,7 @@ func newPublisher(t *testing.T, now time.Time, client delivery.HTTPClient, queue
 	if err != nil {
 		t.Fatalf("lifecycle.New() error = %v", err)
 	}
-	publisher, err := New(Options{State: state, Queue: dispatcher, Lifecycle: lifecyclePublisher, DestinationRef: "operations", Clock: clock, DeliveryTTL: time.Hour})
+	publisher, err := New(Options{State: state, Queue: dispatcher, Lifecycle: lifecyclePublisher, DestinationRef: "operations", Clock: clock, DeliveryTTL: time.Hour, Telemetry: recorder})
 	if err != nil {
 		t.Fatalf("report.New() error = %v", err)
 	}
