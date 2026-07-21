@@ -32,8 +32,9 @@ var (
 
 // Adapter is the minimal Docker action surface the coordinator consumes.
 // ValidateAction must recheck the current target selector and replica count
-// immediately before an action. Execute must remain limited to the supplied
-// typed action, and Verify must return only bounded Docker state.
+// before an action. Execute must repeat adapter-owned dynamic target checks in
+// its bounded operation, remain limited to the supplied typed action, and
+// Verify must return only bounded Docker state.
 type Adapter interface {
 	// ValidateAction rechecks the current target and action before execution.
 	ValidateAction(context.Context, contract.ServiceTarget, contract.TypedAction) error
@@ -49,12 +50,34 @@ type Clock interface {
 	Now() time.Time
 }
 
+// StateSource loads the daemon-owned current execution facts for one command.
+// Each Load call must return a fresh immutable snapshot; a request's initial
+// policy and target fields are never authoritative for Adapter.Execute.
+type StateSource interface {
+	// Load returns the current target, registered policy, and dynamic policy facts.
+	Load(context.Context, contract.RecoveryCommand) (ExecutionState, error)
+}
+
+// ExecutionState is the current daemon-owned authorization context for one
+// persisted recovery command. Its fields are read-only at the coordinator
+// boundary and must describe the same runbook, target, and action as Command.
+type ExecutionState struct {
+	// Target is the latest registered Docker target.
+	Target contract.ServiceTarget
+	// PolicySnapshot is the latest registered policy and runbook view.
+	PolicySnapshot policy.Snapshot
+	// PolicyInput contains the latest dynamic preconditions and retry facts.
+	PolicyInput policy.Input
+}
+
 // Options configures one daemon-owned recovery coordinator.
 type Options struct {
 	// State is the daemon-owned store holding the command journal.
 	State *store.Store
 	// Adapter applies only already-validated Docker actions.
 	Adapter Adapter
+	// StateSource reloads the latest daemon-owned execution facts before an action.
+	StateSource StateSource
 	// Clock supplies deterministic issuance, expiry, and reconciliation times.
 	Clock Clock
 	// NewCommandID creates an immutable identifier for a new recovery command.
@@ -66,6 +89,7 @@ type Options struct {
 type Coordinator struct {
 	state        *store.Store
 	adapter      Adapter
+	stateSource  StateSource
 	clock        Clock
 	newCommandID func() (string, error)
 }
@@ -79,9 +103,11 @@ type Request struct {
 	IncidentID string
 	// Target is the current registered Docker target.
 	Target contract.ServiceTarget
-	// PolicySnapshot is the current immutable registered-runbook snapshot.
+	// PolicySnapshot is the initial registered-runbook snapshot used to prepare
+	// the pending command. StateSource supplies the authoritative execution view.
 	PolicySnapshot policy.Snapshot
-	// PolicyInput contains the current dynamic authorization facts.
+	// PolicyInput contains the initial dynamic authorization facts used to prepare
+	// the pending command. StateSource supplies the authoritative execution view.
 	PolicyInput policy.Input
 	// ExpiresAt bounds how long this command may be executed.
 	ExpiresAt time.Time
@@ -133,12 +159,13 @@ type ReconciliationResult struct {
 
 // New validates dependencies and constructs a recovery coordinator.
 func New(options Options) (*Coordinator, error) {
-	if options.State == nil || options.Adapter == nil || options.Clock == nil || options.NewCommandID == nil {
+	if options.State == nil || options.Adapter == nil || options.StateSource == nil || options.Clock == nil || options.NewCommandID == nil {
 		return nil, ErrInvalidOptions
 	}
 	return &Coordinator{
 		state:        options.State,
 		adapter:      options.Adapter,
+		stateSource:  options.StateSource,
 		clock:        options.Clock,
 		newCommandID: options.NewCommandID,
 	}, nil
@@ -183,7 +210,7 @@ func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, erro
 	if decision.Verdict != policy.VerdictAllow {
 		return Result{}, ErrInvalidRequest
 	}
-	return c.execute(ctx, request, record)
+	return c.execute(ctx, record)
 }
 
 // Reconcile reads interrupted executable commands after process restart. It
@@ -233,7 +260,7 @@ func (c *Coordinator) prepare(request Request, now time.Time) (journalRecord, bo
 	if !validToken(commandID, maxCommandIDLength) {
 		return journalRecord{}, false, policy.Decision{}, ErrInvalidOptions
 	}
-	input := policyInput(request, commandID, now)
+	input := policyInput(request.PolicyInput, commandID, now)
 	decision := policy.Evaluate(request.PolicySnapshot, input)
 	if decision.Verdict == policy.VerdictDeny {
 		return journalRecord{}, false, decision, nil
@@ -278,33 +305,38 @@ func (c *Coordinator) prepare(request Request, now time.Time) (journalRecord, bo
 	return persisted, duplicate, decision, nil
 }
 
-func (c *Coordinator) execute(ctx context.Context, request Request, record journalRecord) (Result, error) {
-	now, err := c.now()
+func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result, error) {
+	decision, now, expired, err := c.revalidate(ctx, record)
 	if err != nil {
-		return Result{}, err
+		return c.denyAfterRevalidation(record, decision, err)
 	}
-	if !now.Before(record.Command.ExpiresAt) {
+	if expired {
 		updated, updateErr := c.expire(recordKey(record.Command))
 		if updateErr != nil {
 			return Result{}, updateErr
 		}
 		return Result{Command: updated.Command, Outcome: OutcomeExpired}, nil
 	}
-
-	decision := c.revalidate(request, record, now)
 	if decision.Verdict != policy.VerdictAllow {
-		updated, updateErr := c.deny(recordKey(record.Command))
-		if updateErr != nil {
-			return Result{}, updateErr
-		}
-		return Result{Command: updated.Command, Outcome: OutcomeDenied, Decision: decision}, nil
+		return c.denyAfterRevalidation(record, decision, nil)
 	}
 	if err := c.adapter.ValidateAction(ctx, record.Target, record.Action); err != nil {
-		updated, updateErr := c.deny(recordKey(record.Command))
+		return c.denyAfterRevalidation(record, decision, fmt.Errorf("validate recovery action: %w", err))
+	}
+
+	decision, now, expired, err = c.revalidate(ctx, record)
+	if err != nil {
+		return c.denyAfterRevalidation(record, decision, err)
+	}
+	if expired {
+		updated, updateErr := c.expire(recordKey(record.Command))
 		if updateErr != nil {
 			return Result{}, updateErr
 		}
-		return Result{Command: updated.Command, Outcome: OutcomeDenied, Decision: decision}, fmt.Errorf("validate recovery action: %w", err)
+		return Result{Command: updated.Command, Outcome: OutcomeExpired}, nil
+	}
+	if decision.Verdict != policy.VerdictAllow {
+		return c.denyAfterRevalidation(record, decision, nil)
 	}
 
 	if _, err := c.approve(recordKey(record.Command)); err != nil {
@@ -328,24 +360,47 @@ func (c *Coordinator) execute(ctx context.Context, request Request, record journ
 	return Result{Command: succeeded.Command, Outcome: OutcomeExecuted, Decision: decision}, nil
 }
 
-func (c *Coordinator) revalidate(request Request, record journalRecord, now time.Time) policy.Decision {
+func (c *Coordinator) denyAfterRevalidation(record journalRecord, decision policy.Decision, cause error) (Result, error) {
+	updated, updateErr := c.deny(recordKey(record.Command))
+	if updateErr != nil {
+		return Result{}, updateErr
+	}
+	result := Result{Command: updated.Command, Outcome: OutcomeDenied, Decision: decision}
+	return result, cause
+}
+
+func (c *Coordinator) revalidate(ctx context.Context, record journalRecord) (policy.Decision, time.Time, bool, error) {
+	state, err := c.stateSource.Load(ctx, record.Command)
+	if err != nil {
+		return policy.Decision{Verdict: policy.VerdictDeny, ReasonCode: policy.ReasonInvalidPolicy}, time.Time{}, false, fmt.Errorf("load current recovery state: %w", err)
+	}
+	now, err := c.now()
+	if err != nil {
+		return policy.Decision{}, time.Time{}, false, err
+	}
+	if !now.Before(record.Command.ExpiresAt) {
+		return policy.Decision{}, now, true, nil
+	}
+	return revalidateState(state, record, now), now, false, nil
+}
+
+func revalidateState(state ExecutionState, record journalRecord, now time.Time) policy.Decision {
 	command := record.Command
-	if request.PolicyInput.RunbookID != command.RunbookID || request.PolicyInput.RunbookDigest != command.RunbookDigest || request.PolicyInput.TargetID != command.TargetID || request.PolicyInput.ActionIndex != command.ActionIndex || !sameExecutionTarget(request.Target, record.Target) {
+	if state.PolicyInput.RunbookID != command.RunbookID || state.PolicyInput.RunbookDigest != command.RunbookDigest || state.PolicyInput.TargetID != command.TargetID || state.PolicyInput.ActionIndex != command.ActionIndex || !sameExecutionTarget(state.Target, record.Target) {
 		return policy.Decision{Verdict: policy.VerdictDeny, ReasonCode: policy.ReasonInvalidPolicy}
 	}
-	registered, found := registeredRunbook(request.PolicySnapshot, command.RunbookID)
+	registered, found := registeredRunbook(state.PolicySnapshot, command.RunbookID)
 	if !found || command.ActionIndex < 0 || command.ActionIndex >= len(registered.Runbook.TypedActions) || registered.Runbook.TypedActions[command.ActionIndex] != record.Action {
 		return policy.Decision{Verdict: policy.VerdictDeny, ReasonCode: policy.ReasonInvalidPolicy}
 	}
-	return policy.Evaluate(request.PolicySnapshot, policyInput(request, command.CommandID, now))
+	return policy.Evaluate(state.PolicySnapshot, policyInput(state.PolicyInput, command.CommandID, now))
 }
 
 func sameExecutionTarget(current, recorded contract.ServiceTarget) bool {
 	return current.SchemaVersion == recorded.SchemaVersion && current.TargetID == recorded.TargetID && current.AdapterType == recorded.AdapterType && current.Selector == recorded.Selector && current.Enabled == recorded.Enabled
 }
 
-func policyInput(request Request, commandID string, now time.Time) policy.Input {
-	input := request.PolicyInput
+func policyInput(input policy.Input, commandID string, now time.Time) policy.Input {
 	input.CommandID = commandID
 	input.Now = now
 	return input

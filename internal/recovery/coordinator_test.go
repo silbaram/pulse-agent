@@ -55,65 +55,79 @@ func TestCoordinator_SubmitPersistsPendingBeforeAdapterExecution(t *testing.T) {
 	}
 }
 
-func TestCoordinator_ExecutionRevalidatesChangedPolicyFacts(t *testing.T) {
+func TestCoordinator_SubmitReloadsAuthoritativeFactsAfterAdapterValidation(t *testing.T) {
 	now := testNow()
 	tests := []struct {
 		name       string
-		mutate     func(*Request)
+		mutate     func(*fakeStateSource)
 		wantReason policy.ReasonCode
 	}{
 		{
 			name: "forged digest",
-			mutate: func(request *Request) {
-				request.PolicySnapshot.Runbooks[0].Runbook.Digest = "changed-digest"
+			mutate: func(source *fakeStateSource) {
+				source.state.PolicySnapshot.Runbooks[0].Runbook.Digest = "changed-digest"
 			},
 			wantReason: policy.ReasonForgedDigest,
 		},
 		{
 			name: "target registration changed",
-			mutate: func(request *Request) {
-				request.PolicySnapshot.Runbooks[0].TargetID = "other-target"
+			mutate: func(source *fakeStateSource) {
+				source.state.PolicySnapshot.Runbooks[0].TargetID = "other-target"
 			},
 			wantReason: policy.ReasonTargetMismatch,
 		},
 		{
 			name: "target selector changed",
-			mutate: func(request *Request) {
-				request.Target.Selector = "container:replacement"
+			mutate: func(source *fakeStateSource) {
+				source.state.Target.Selector = "container:replacement"
 			},
 			wantReason: policy.ReasonInvalidPolicy,
 		},
 		{
 			name: "precondition no longer holds",
-			mutate: func(request *Request) {
-				request.PolicyInput.Preconditions["docker_healthy"] = false
+			mutate: func(source *fakeStateSource) {
+				source.state.PolicyInput.Preconditions["docker_healthy"] = false
 			},
 			wantReason: policy.ReasonPreconditionFailed,
+		},
+		{
+			name: "cooldown became active",
+			mutate: func(source *fakeStateSource) {
+				source.state.PolicyInput.LastAttemptAt = now
+			},
+			wantReason: policy.ReasonCooldownActive,
+		},
+		{
+			name: "retry budget exhausted",
+			mutate: func(source *fakeStateSource) {
+				source.state.PolicyInput.AttemptCount = 2
+			},
+			wantReason: policy.ReasonRetryExhausted,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			state := openState(t)
 			adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
-			coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
 			request := testRequest(now)
-			record, duplicate, decision, err := coordinator.prepare(request, now)
-			if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
-				t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
-			}
-			test.mutate(&request)
+			source := &fakeStateSource{state: executionState(testRequest(now))}
+			adapter.onValidate = func() { test.mutate(source) }
+			coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}}, source)
 
-			result, err := coordinator.execute(context.Background(), request, record)
+			result, err := coordinator.Submit(context.Background(), request)
 			if err != nil {
-				t.Fatalf("execute() error = %v", err)
+				t.Fatalf("Submit() error = %v", err)
 			}
 			if result.Outcome != OutcomeDenied || result.Decision.ReasonCode != test.wantReason {
-				t.Fatalf("execute() = %#v, want denied/%q", result, test.wantReason)
+				t.Fatalf("Submit() = %#v, want denied/%q", result, test.wantReason)
 			}
-			if adapter.validateCalls != 0 || adapter.executeCalls != 0 {
-				t.Fatalf("adapter calls = validate=%d execute=%d, want no adapter call", adapter.validateCalls, adapter.executeCalls)
+			if adapter.validateCalls != 1 || adapter.executeCalls != 0 {
+				t.Fatalf("adapter calls = validate=%d execute=%d, want final revalidation to stop execution", adapter.validateCalls, adapter.executeCalls)
 			}
-			stored := readRecord(t, state, record.Command)
+			if source.loads != 2 {
+				t.Fatalf("StateSource.Load() calls = %d, want 2", source.loads)
+			}
+			stored := readRecord(t, state, result.Command)
 			if stored.Phase != phaseCompleted || stored.Command.State != contract.RecoveryDenied {
 				t.Fatalf("stored command = phase=%q state=%q, want completed/denied", stored.Phase, stored.Command.State)
 			}
@@ -161,6 +175,51 @@ func TestCoordinator_SubmitExpiresImmediatelyBeforeExecute(t *testing.T) {
 	stored := readRecord(t, state, result.Command)
 	if stored.Command.State != contract.RecoveryExpired {
 		t.Fatalf("stored state = %q, want expired", stored.Command.State)
+	}
+}
+
+func TestCoordinator_SubmitExpiresDuringAdapterValidation(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	request := testRequest(now)
+	request.ExpiresAt = now.Add(time.Minute)
+	source := &fakeStateSource{state: executionState(testRequest(now))}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, request.ExpiresAt}}, source)
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Outcome != OutcomeExpired || adapter.validateCalls != 1 || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, calls=%d/%d, want expiry after validation with no execution", result, adapter.validateCalls, adapter.executeCalls)
+	}
+	if source.loads != 2 {
+		t.Fatalf("StateSource.Load() calls = %d, want 2", source.loads)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Command.State != contract.RecoveryExpired {
+		t.Fatalf("stored state = %q, want expired", stored.Command.State)
+	}
+}
+
+func TestCoordinator_SubmitFailsClosedWhenCurrentStateCannotLoad(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	source := &fakeStateSource{err: errors.New("state unavailable")}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}}, source)
+
+	result, err := coordinator.Submit(context.Background(), testRequest(now))
+	if err == nil || result.Outcome != OutcomeDenied || result.Decision.ReasonCode != policy.ReasonInvalidPolicy {
+		t.Fatalf("Submit() = %#v, %v, want denied invalid policy with state-load error", result, err)
+	}
+	if adapter.validateCalls != 0 || adapter.executeCalls != 0 {
+		t.Fatalf("adapter calls = validate=%d execute=%d, want no adapter interaction", adapter.validateCalls, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Command.State != contract.RecoveryDenied {
+		t.Fatalf("stored state = %q, want denied", stored.Command.State)
 	}
 }
 
@@ -375,6 +434,20 @@ func (a *fakeAdapter) Verify(_ context.Context, _ contract.ServiceTarget) (docke
 	return a.snapshot, nil
 }
 
+type fakeStateSource struct {
+	state ExecutionState
+	err   error
+	loads int
+}
+
+func (s *fakeStateSource) Load(_ context.Context, _ contract.RecoveryCommand) (ExecutionState, error) {
+	s.loads++
+	if s.err != nil {
+		return ExecutionState{}, s.err
+	}
+	return s.state, nil
+}
+
 type sequenceClock struct {
 	times []time.Time
 	index int
@@ -392,13 +465,21 @@ func (c *sequenceClock) Now() time.Time {
 	return now
 }
 
-func newCoordinator(t *testing.T, state *store.Store, adapter Adapter, clock Clock) *Coordinator {
+func newCoordinator(t *testing.T, state *store.Store, adapter Adapter, clock Clock, sources ...StateSource) *Coordinator {
 	t.Helper()
+	source := StateSource(&fakeStateSource{state: executionState(testRequest(testNow()))})
+	if len(sources) == 1 {
+		source = sources[0]
+	}
+	if len(sources) > 1 {
+		t.Fatalf("newCoordinator() received %d state sources, want at most 1", len(sources))
+	}
 	nextID := 0
 	coordinator, err := New(Options{
-		State:   state,
-		Adapter: adapter,
-		Clock:   clock,
+		State:       state,
+		Adapter:     adapter,
+		StateSource: source,
+		Clock:       clock,
 		NewCommandID: func() (string, error) {
 			nextID++
 			return fmt.Sprintf("command-%d", nextID), nil
@@ -492,6 +573,14 @@ func testRequest(now time.Time) Request {
 		},
 		ExpiresAt:      now.Add(5 * time.Minute),
 		IdempotencyKey: "delivery-1",
+	}
+}
+
+func executionState(request Request) ExecutionState {
+	return ExecutionState{
+		Target:         request.Target,
+		PolicySnapshot: request.PolicySnapshot,
+		PolicyInput:    request.PolicyInput,
 	}
 }
 

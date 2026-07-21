@@ -156,6 +156,8 @@ func (a *Adapter) CollectEvidence(ctx context.Context, target contract.ServiceTa
 }
 
 // ValidateAction checks an exact target selector and safe restart preconditions.
+// A running unhealthy container is eligible: health is the recovery trigger,
+// while post-restart health belongs to the stabilization verifier.
 func (a *Adapter) ValidateAction(ctx context.Context, target contract.ServiceTarget, action contract.TypedAction) error {
 	_, err := a.validatedContainer(ctx, target, action)
 	return err
@@ -169,7 +171,7 @@ func (a *Adapter) validatedContainer(ctx context.Context, target contract.Servic
 	if err != nil {
 		return Container{}, err
 	}
-	if !container.Running || container.Health == "unhealthy" {
+	if !container.Running {
 		return Container{}, ErrPrecondition
 	}
 	return container, nil
