@@ -15,6 +15,7 @@ import (
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
 
@@ -25,9 +26,17 @@ func (f runnerFunc) Run(ctx context.Context) error {
 }
 
 type fakeAdminClient struct {
-	status   func(context.Context, string, string) (adminipc.Status, error)
-	backup   func(context.Context, string, string, io.Writer) error
-	register func(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
+	status          func(context.Context, string, string) (adminipc.Status, error)
+	backup          func(context.Context, string, string, io.Writer) error
+	register        func(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
+	registerRunbook func(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
+}
+
+func (c fakeAdminClient) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
+	if c.registerRunbook == nil {
+		return runbook.RegistrationResult{}, errors.New("unexpected runbook registration")
+	}
+	return c.registerRunbook(ctx, socketPath, reasonCode, submitted)
 }
 
 func (c fakeAdminClient) Status(ctx context.Context, socketPath, reasonCode string) (adminipc.Status, error) {
@@ -74,8 +83,6 @@ func TestExecute_HelpExposesApprovedCommands(t *testing.T) {
 		"standalone",
 		"config validate",
 		"target register",
-		"runbook validate",
-		"runbook register",
 		"incident list",
 		"incident show",
 		"approval grant",
@@ -95,8 +102,6 @@ func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing
 		name string
 		args []string
 	}{
-		{name: "runbook validate", args: []string{"runbook", "validate"}},
-		{name: "runbook register", args: []string{"runbook", "register"}},
 		{name: "incident list", args: []string{"incident", "list"}},
 		{name: "incident show", args: []string{"incident", "show"}},
 		{name: "approval grant", args: []string{"approval", "grant"}},
@@ -212,6 +217,43 @@ func TestExecute_TargetRegisterRoutesThroughDaemonClient(t *testing.T) {
 	}
 	if result.Version != 1 || result.TargetID != submitted.TargetID {
 		t.Errorf("target registration result = %#v, want registered target", result)
+	}
+}
+
+func TestExecute_RunbookValidateIsLocalAndRegisterUsesDaemonClient(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "runbook.md"), []byte("---\nrunbook_id: restart-checkout\nversion: 1\n---\n"), 0o600); err != nil {
+		t.Fatalf("write markdown: %v", err)
+	}
+	document := []byte(`{"schema_version":"v1","runbook_id":"restart-checkout","version":"1","adapter_type":"docker","target_constraints":[],"typed_actions":[{"action_type":"docker.container.restart","target_selector":"container:checkout","stop_timeout":"5s","cooldown":"0s"}],"risk_tier":"low","auto_execute":false,"approval_policy":{"required":false},"preconditions":[],"retry_policy":{"max_attempts":1},"stabilization_policy":{"recovery_samples":1,"window":"1m"}}`)
+	if err := os.WriteFile(filepath.Join(directory, "runbook.json"), document, 0o600); err != nil {
+		t.Fatalf("write contract: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := executeWithDependencies(context.Background(), []string{"runbook", "validate", "--runbook", directory}, &stdout, &stderr, runnerFunc(func(context.Context) error { return nil }), config.Load, fakeAdminClient{}); code != ExitSuccess {
+		t.Fatalf("validate exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "restart-checkout") {
+		t.Errorf("validate stdout = %q, want runbook result", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	called := false
+	client := fakeAdminClient{registerRunbook: func(_ context.Context, socketPath, reason string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
+		called = true
+		if socketPath == "" || reason == "" || submitted.Digest == "" {
+			t.Errorf("daemon request = socket=%q reason=%q runbook=%#v", socketPath, reason, submitted)
+		}
+		return runbook.RegistrationResult{SchemaVersion: runbook.SchemaVersion, RunbookID: submitted.RunbookID, Digest: submitted.Digest}, nil
+	}}
+	loader := func(string) (config.Config, error) {
+		return config.Config{Admin: config.AdminConfig{SocketPath: "/tmp/pulse-agent/admin.sock"}}, nil
+	}
+	if code := executeWithDependencies(context.Background(), []string{"runbook", "register", "--config", "config.json", "--runbook", directory}, &stdout, &stderr, runnerFunc(func(context.Context) error { return nil }), loader, client); code != ExitSuccess {
+		t.Fatalf("register exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("runbook register did not use daemon client")
 	}
 }
 

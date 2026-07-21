@@ -11,6 +11,7 @@ import (
 
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
 )
@@ -99,6 +100,14 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 	if err != nil {
 		return fmt.Errorf("create target registry: %w", err)
 	}
+	runbooks, err := runbook.NewRegistry(runbook.Options{
+		State:           state,
+		Clock:           time.Now,
+		NewAuditEventID: runbook.NewAuditEventID,
+	})
+	if err != nil {
+		return fmt.Errorf("create runbook registry: %w", err)
+	}
 
 	server, err := adminipc.NewServer(adminipc.Options{
 		SocketPath:  runtimeConfig.Admin.SocketPath,
@@ -106,6 +115,7 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 		AllowedGIDs: runtimeConfig.Admin.AllowedGIDs,
 		State:       state,
 		Targets:     registry,
+		Runbooks:    runbooks,
 		Clock:       adminipc.SystemClock,
 		NewAuditID:  adminipc.NewAuditID,
 	})

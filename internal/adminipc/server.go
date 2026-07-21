@@ -12,6 +12,7 @@ import (
 
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
 )
@@ -51,6 +52,8 @@ type Options struct {
 	// Targets routes target registrations through one daemon-owned registry.
 	// It may be nil when a server exposes only the earlier status and backup API.
 	Targets *target.Registry
+	// Runbooks routes typed runbook registrations through the daemon-owned registry.
+	Runbooks *runbook.Registry
 	// RequestTimeout bounds each authenticated request and backup stream. Zero
 	// uses the safe default timeout.
 	RequestTimeout time.Duration
@@ -74,6 +77,7 @@ type Server struct {
 	allowedGIDs     map[uint32]struct{}
 	state           *store.Store
 	targets         *target.Registry
+	runbooks        *runbook.Registry
 	requestTimeout  time.Duration
 	peerCredentials PeerCredentials
 	clock           func() time.Time
@@ -129,6 +133,7 @@ func NewServer(options Options) (*Server, error) {
 		allowedGIDs:     allowedGIDs,
 		state:           options.State,
 		targets:         options.Targets,
+		runbooks:        options.Runbooks,
 		requestTimeout:  timeout,
 		peerCredentials: peerCredentials,
 		clock:           options.Clock,
@@ -419,6 +424,23 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 			Result:        resultSuccess,
 			TargetResult:  &result,
 		})
+	case OperationRunbookRegister:
+		if s.runbooks == nil || request.Runbook == nil {
+			if err := s.appendAudit(actor, request.RequestID, auditActionRequest, auditResultRejected, auditReasonUnsupported); err != nil {
+				return err
+			}
+			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
+		}
+		result, err := s.runbooks.Register(runbook.Registration{
+			Pair:          runbook.Pair{Runbook: *request.Runbook, Digest: request.Runbook.Digest},
+			ActorIdentity: actor.Identity(),
+			RequestID:     request.RequestID,
+			ReasonCode:    request.ReasonCode,
+		})
+		if err != nil {
+			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
+		}
+		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, RunbookResult: &result})
 	}
 	return ErrMalformedRequest
 }

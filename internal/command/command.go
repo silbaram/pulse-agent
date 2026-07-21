@@ -12,6 +12,7 @@ import (
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/standalone"
 	"pulse-agent/internal/target"
 )
@@ -54,6 +55,7 @@ type adminClient interface {
 	Status(context.Context, string, string) (adminipc.Status, error)
 	Backup(context.Context, string, string, io.Writer) error
 	Register(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
+	RegisterRunbook(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
 }
 
 type configLoader func(string) (config.Config, error)
@@ -149,12 +151,55 @@ func executeWithDependencies(
 	if args[0] == "target" {
 		return executeTarget(ctx, args, stdout, stderr, loadConfig, client)
 	}
+	if args[0] == "runbook" {
+		return executeRunbook(ctx, args, stdout, stderr, loadConfig, client)
+	}
 
 	if subcommands, ok := commandGroups[args[0]]; ok {
 		return executeGroup(args, stdout, stderr, subcommands)
 	}
 
 	return writeError(stderr, ExitUsage, "unknown_command", args[0], "unknown command")
+}
+
+func executeRunbook(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {
+	if len(args) >= 2 && isHelp(args[len(args)-1]) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent runbook validate --runbook <directory>\n       pulse-agent runbook register --config <path> --runbook <directory> [--reason <code>]")
+		return ExitSuccess
+	}
+	if len(args) == 4 && args[1] == "validate" && args[2] == "--runbook" && args[3] != "" {
+		pair, err := runbook.Load(args[3])
+		if err != nil {
+			return writeError(stderr, ExitUsage, "runbook_invalid", "runbook validate", "runbook pair validation failed")
+		}
+		return writeRunbookValidation(stdout, pair)
+	}
+	if len(args) != 6 && len(args) != 8 {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "runbook", "invalid runbook command arguments")
+	}
+	if args[1] != "register" || args[2] != "--config" || args[3] == "" || args[4] != "--runbook" || args[5] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", "runbook register", "runbook register requires --config <path> --runbook <directory>")
+	}
+	reason := adminipc.DefaultReasonCode
+	if len(args) == 8 {
+		if args[6] != "--reason" || args[7] == "" {
+			return writeError(stderr, ExitUsage, "invalid_arguments", "runbook register", "invalid reason option")
+		}
+		reason = args[7]
+	}
+	pair, err := runbook.Load(args[5])
+	if err != nil {
+		return writeError(stderr, ExitUsage, "runbook_invalid", "runbook register", "runbook pair validation failed")
+	}
+	runtimeConfig, err := loadConfig(args[3])
+	if err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", "runbook register", "configuration validation failed")
+	}
+	result, err := client.RegisterRunbook(ctx, runtimeConfig.Admin.SocketPath, reason, pair.Runbook)
+	if err != nil {
+		return writeAdminRequestError(stderr, "runbook register", err)
+	}
+	return writeRunbookRegistrationResult(stdout, result)
 }
 
 func executeTarget(
@@ -330,6 +375,28 @@ func writeStatus(stdout io.Writer, status adminipc.Status) int {
 }
 
 func writeTargetRegistrationResult(stdout io.Writer, result target.RegistrationResult) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(result); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
+func writeRunbookValidation(stdout io.Writer, pair runbook.Pair) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(struct {
+		SchemaVersion string `json:"schema_version"`
+		RunbookID     string `json:"runbook_id"`
+		Digest        string `json:"digest"`
+	}{SchemaVersion: runbook.SchemaVersion, RunbookID: pair.Runbook.RunbookID, Digest: pair.Digest}); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
+func writeRunbookRegistrationResult(stdout io.Writer, result runbook.RegistrationResult) int {
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(result); err != nil && !errors.Is(err, io.ErrClosedPipe) {

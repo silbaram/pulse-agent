@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
 
@@ -91,7 +92,7 @@ func NewProductionClient() (*Client, error) {
 
 // Status requests the safe bounded daemon status without opening local state.
 func (c *Client) Status(ctx context.Context, socketPath, reasonCode string) (Status, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -113,7 +114,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	if destination == nil {
 		return ErrInvalidOptions
 	}
-	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil)
+	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -142,7 +143,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 // Register submits a strict target document to the daemon. The client never
 // opens local state, performs a target-store transaction, or writes audit data.
 func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, submitted contract.ServiceTarget) (target.RegistrationResult, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -158,7 +159,26 @@ func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, su
 	return *response.TargetResult, nil
 }
 
-func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
+// RegisterRunbook submits a previously validated typed runbook through the
+// daemon-owned local IPC boundary.
+func (c *Client) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationRunbookRegister, reasonCode, nil, &submitted)
+	if stopClose != nil {
+		defer stopClose()
+	}
+	if connection != nil {
+		defer connection.Close()
+	}
+	if err != nil {
+		return runbook.RegistrationResult{}, err
+	}
+	if response.Status != nil || response.BackupSize != 0 || response.TargetResult != nil || response.RunbookResult == nil {
+		return runbook.RegistrationResult{}, ErrMalformedResponse
+	}
+	return *response.RunbookResult, nil
+}
+
+func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget, submittedRunbook *contract.Runbook) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
 	if ctx == nil || c == nil || c.requestTimeout <= 0 || c.clock == nil || c.newRequestID == nil || !validOperation(operation) || !validReasonCode(reasonCode) {
 		return response{}, nil, nil, nil, ErrInvalidOptions
 	}
@@ -180,6 +200,7 @@ func (c *Client) request(ctx context.Context, socketPath string, operation Opera
 		Operation:     operation,
 		ReasonCode:    reasonCode,
 		Target:        submitted,
+		Runbook:       submittedRunbook,
 	}
 	if err := writeMessage(connection, request); err != nil {
 		stopClose()

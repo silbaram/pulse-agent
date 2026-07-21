@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
 )
@@ -280,6 +281,49 @@ func TestServer_TargetRegisterRejectsUnauthorizedPeer(t *testing.T) {
 		t.Fatalf("audit event count = %d, want 1", len(events))
 	}
 	assertAuditEvent(t, events[0], auditActionRequest, auditResultRejected, auditReasonUnauthorized)
+	stop()
+}
+
+func TestServer_RunbookRegisterUsesDaemonRegistryAndRejectsDuplicate(t *testing.T) {
+	state := openTestStore(t)
+	registry := newTestRunbookRegistry(t, state)
+	server, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) { return authorizedTestActor, nil })
+	server.runbooks = registry
+	client := newTestClient(t, time.Second)
+	submitted := testRunbook(t)
+	result, err := client.RegisterRunbook(context.Background(), socketPath, "onboarding", submitted)
+	if err != nil {
+		t.Fatalf("RegisterRunbook() error = %v", err)
+	}
+	if result.RunbookID != submitted.RunbookID || result.Digest != submitted.Digest {
+		t.Errorf("result = %#v, want registered runbook", result)
+	}
+	if _, err := client.RegisterRunbook(context.Background(), socketPath, "onboarding", submitted); !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("duplicate RegisterRunbook() error = %v, want %v", err, ErrRequestRejected)
+	}
+	stop()
+}
+
+func TestServer_RunbookRegisterRejectsUnauthorizedPeer(t *testing.T) {
+	state := openTestStore(t)
+	registry := newTestRunbookRegistry(t, state)
+	unauthorized := Actor{UID: authorizedTestActor.UID + 1, GID: authorizedTestActor.GID}
+	server, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) { return unauthorized, nil })
+	server.runbooks = registry
+	_, err := newTestClient(t, time.Second).RegisterRunbook(context.Background(), socketPath, "onboarding", testRunbook(t))
+	if !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("RegisterRunbook() error = %v, want %v", err, ErrRequestRejected)
+	}
+	err = state.View(func(tx *store.Tx) error {
+		_, found, err := tx.Get(store.BucketRunbooks, "restart-checkout")
+		if err != nil || found {
+			t.Errorf("unauthorized runbook found=%v err=%v", found, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("state.View() error = %v", err)
+	}
 	stop()
 }
 
@@ -550,6 +594,24 @@ func newTestTargetRegistry(t *testing.T, state *store.Store) *target.Registry {
 		t.Fatalf("target.NewRegistry() error = %v", err)
 	}
 	return registry
+}
+
+func newTestRunbookRegistry(t *testing.T, state *store.Store) *runbook.Registry {
+	t.Helper()
+	registry, err := runbook.NewRegistry(runbook.Options{State: state, Clock: func() time.Time { return time.Now() }, NewAuditEventID: newTestIDGenerator("runbook-test")})
+	if err != nil {
+		t.Fatalf("runbook.NewRegistry() error = %v", err)
+	}
+	return registry
+}
+
+func testRunbook(t *testing.T) contract.Runbook {
+	t.Helper()
+	pair, err := runbook.Decode([]byte("---\nrunbook_id: restart-checkout\nversion: 1\n---\n"), []byte(`{"schema_version":"v1","runbook_id":"restart-checkout","version":"1","adapter_type":"docker","target_constraints":[],"typed_actions":[{"action_type":"docker.container.restart","target_selector":"container:checkout","stop_timeout":"5s","cooldown":"0s"}],"risk_tier":"low","auto_execute":false,"approval_policy":{"required":false},"preconditions":[],"retry_policy":{"max_attempts":1},"stabilization_policy":{"recovery_samples":1,"window":"1m"}}`))
+	if err != nil {
+		t.Fatalf("runbook.Decode() error = %v", err)
+	}
+	return pair.Runbook
 }
 
 func testServiceTarget() contract.ServiceTarget {

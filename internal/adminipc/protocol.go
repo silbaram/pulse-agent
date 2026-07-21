@@ -9,6 +9,7 @@ import (
 	"io"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/target"
 )
 
@@ -68,6 +69,8 @@ const (
 	// OperationTargetRegister submits one target document for daemon-owned
 	// validation, persistence, and audit.
 	OperationTargetRegister Operation = "target.register"
+	// OperationRunbookRegister submits one validated typed runbook to the daemon.
+	OperationRunbookRegister Operation = "runbook.register"
 )
 
 // StatusState identifies the lifecycle state returned by an administrative
@@ -117,6 +120,8 @@ type Request struct {
 	ReasonCode string `json:"reason_code"`
 	// Target is present only for a target registration request.
 	Target *contract.ServiceTarget `json:"target,omitempty"`
+	// Runbook is present only for a runbook registration request.
+	Runbook *contract.Runbook `json:"runbook,omitempty"`
 }
 
 type result string
@@ -127,13 +132,14 @@ const (
 )
 
 type response struct {
-	SchemaVersion string                     `json:"schema_version"`
-	RequestID     string                     `json:"request_id,omitempty"`
-	Result        result                     `json:"result"`
-	ErrorCode     string                     `json:"error_code,omitempty"`
-	Status        *Status                    `json:"status,omitempty"`
-	BackupSize    int64                      `json:"backup_size,omitempty"`
-	TargetResult  *target.RegistrationResult `json:"target_result,omitempty"`
+	SchemaVersion string                      `json:"schema_version"`
+	RequestID     string                      `json:"request_id,omitempty"`
+	Result        result                      `json:"result"`
+	ErrorCode     string                      `json:"error_code,omitempty"`
+	Status        *Status                     `json:"status,omitempty"`
+	BackupSize    int64                       `json:"backup_size,omitempty"`
+	TargetResult  *target.RegistrationResult  `json:"target_result,omitempty"`
+	RunbookResult *runbook.RegistrationResult `json:"runbook_result,omitempty"`
 }
 
 func (r Request) validate() error {
@@ -142,11 +148,15 @@ func (r Request) validate() error {
 	}
 	switch r.Operation {
 	case OperationTargetRegister:
-		if r.Target == nil || r.Target.SchemaVersion != SchemaVersion {
+		if r.Target == nil || r.Target.SchemaVersion != SchemaVersion || r.Runbook != nil {
+			return ErrMalformedRequest
+		}
+	case OperationRunbookRegister:
+		if r.Runbook == nil || r.Runbook.SchemaVersion != SchemaVersion || r.Target != nil {
 			return ErrMalformedRequest
 		}
 	default:
-		if r.Target != nil {
+		if r.Target != nil || r.Runbook != nil {
 			return ErrMalformedRequest
 		}
 	}
@@ -172,7 +182,7 @@ func (r response) validate() error {
 	if r.Status != nil && !r.Status.valid() {
 		return ErrMalformedResponse
 	}
-	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) {
+	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) || (r.RunbookResult != nil && !validRunbookResult(*r.RunbookResult)) {
 		return ErrMalformedResponse
 	}
 	return nil
@@ -189,6 +199,9 @@ func responsePayloadCount(value response) int {
 	if value.TargetResult != nil {
 		count++
 	}
+	if value.RunbookResult != nil {
+		count++
+	}
 	return count
 }
 
@@ -197,6 +210,10 @@ func validTargetResult(result target.RegistrationResult) bool {
 		return false
 	}
 	return true
+}
+
+func validRunbookResult(result runbook.RegistrationResult) bool {
+	return result.SchemaVersion == SchemaVersion && result.RunbookID != "" && result.Digest != ""
 }
 
 func (s Status) valid() bool {
@@ -217,7 +234,7 @@ func (s Status) valid() bool {
 }
 
 func validOperation(operation Operation) bool {
-	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister
+	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister || operation == OperationRunbookRegister
 }
 
 func validRequestID(value string) bool {
