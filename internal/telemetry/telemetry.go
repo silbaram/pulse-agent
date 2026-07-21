@@ -65,6 +65,8 @@ const (
 	ComponentTarget Component = "target"
 	// ComponentWebhook identifies inbound and outbound webhook work.
 	ComponentWebhook Component = "webhook"
+	// ComponentObserver identifies deterministic direct-observation work.
+	ComponentObserver Component = "observer"
 )
 
 // Operation identifies one stable unit of component work. Values are
@@ -292,7 +294,7 @@ func (e Event) attributes() []attribute.KeyValue {
 
 func validComponent(value Component) bool {
 	switch value {
-	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook:
+	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook, ComponentObserver:
 		return true
 	default:
 		return false

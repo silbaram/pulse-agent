@@ -292,15 +292,18 @@ type ServiceTarget struct {
 
 // HealthObservation is a normalized observation with bounded metric values.
 type HealthObservation struct {
-	SchemaVersion   string             `json:"schema_version"`
-	ObservationID   string             `json:"observation_id"`
-	TargetID        string             `json:"target_id"`
-	RuleID          string             `json:"rule_id"`
-	ObservedAt      time.Time          `json:"observed_at"`
-	NormalizedState NormalizedState    `json:"normalized_state"`
-	BoundedValues   map[string]float64 `json:"bounded_values"`
-	EvidenceRefs    []string           `json:"evidence_refs"`
-	Sequence        uint64             `json:"sequence"`
+	SchemaVersion string `json:"schema_version"`
+	ObservationID string `json:"observation_id"`
+	TargetID      string `json:"target_id"`
+	RuleID        string `json:"rule_id"`
+	// TargetSnapshotVersion identifies the immutable target-registry snapshot
+	// used for the whole scheduler cycle that produced this observation.
+	TargetSnapshotVersion uint64             `json:"target_snapshot_version"`
+	ObservedAt            time.Time          `json:"observed_at"`
+	NormalizedState       NormalizedState    `json:"normalized_state"`
+	BoundedValues         map[string]float64 `json:"bounded_values"`
+	EvidenceRefs          []string           `json:"evidence_refs"`
+	Sequence              uint64             `json:"sequence"`
 }
 
 // Incident is the durable record for one deduplicated service failure.
