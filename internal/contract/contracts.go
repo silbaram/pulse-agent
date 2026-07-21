@@ -626,6 +626,7 @@ type LifecycleEvent struct {
 	IncidentID    string             `json:"incident_id"`
 	OccurredAt    time.Time          `json:"occurred_at"`
 	ReasonCode    string             `json:"reason_code"`
+	EvidenceRefs  []string           `json:"evidence_refs"`
 }
 
 // Validate verifies the LifecycleEvent contract.
@@ -639,8 +640,13 @@ func (l LifecycleEvent) Validate() error {
 	if err := required("incident_id", l.IncidentID); err != nil {
 		return err
 	}
-	if !validLifecycleEvent(l.EventType) || l.OccurredAt.IsZero() {
+	if !validLifecycleEvent(l.EventType) || l.OccurredAt.IsZero() || len(l.EvidenceRefs) > maxReferenceCount {
 		return invalid("lifecycle event")
+	}
+	for _, reference := range l.EvidenceRefs {
+		if err := required("lifecycle evidence reference", reference); err != nil {
+			return err
+		}
 	}
 	return nil
 }
