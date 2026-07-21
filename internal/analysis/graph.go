@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	maxEvidenceBytes = 64 * 1024
-	maxRunbooks      = 64
-	maxAttempts      = 2
-	maxTimeout       = 2 * time.Minute
+	maxEvidenceBytes        = 64 * 1024
+	maxRunbooks             = 64
+	maxAttempts             = 2
+	maxTimeout              = 2 * time.Minute
+	secretPatternExpression = `(?i)\b(?:api[_-]?key|token|password|secret|authorization)\b\s*(?:(?:[:=]\s*(?:bearer\s+)?)|(?:bearer\s+))([^\s,;]+)`
 )
 
 var (
@@ -32,8 +33,6 @@ var (
 	// ErrInvalidResult indicates a model response outside the strict result contract.
 	ErrInvalidResult = errors.New("invalid analysis result")
 )
-
-var secretPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|token|password|secret|authorization)\b\s*(?:[:=]|bearer\s+)\s*[^\s,;]+`)
 
 // Status identifies whether analysis completed or fell back safely.
 type Status string
@@ -199,7 +198,7 @@ func (g *Graph) prepareEvidence(input Input) (preparedInput, error) {
 	evidenceIDs := make(map[string]struct{}, len(input.Evidence))
 	preparedEvidence := make([]Evidence, 0, len(input.Evidence))
 	for _, item := range input.Evidence {
-		if !validEvidence(item) || secretPattern.MatchString(item.Content) || item.Reference.ByteCount != len(item.Content) || totalBytes+len(item.Content) > g.maxEvidenceBytes {
+		if !validEvidence(item) || containsUnredactedSecret(item.Content) || item.Reference.ByteCount != len(item.Content) || totalBytes+len(item.Content) > g.maxEvidenceBytes {
 			return preparedInput{}, ErrInvalidInput
 		}
 		if _, duplicate := evidenceIDs[item.Reference.EvidenceID]; duplicate {
@@ -222,6 +221,15 @@ func (g *Graph) prepareEvidence(input Input) (preparedInput, error) {
 		preparedRunbooks = append(preparedRunbooks, item)
 	}
 	return preparedInput{incidentID: input.IncidentID, evidence: preparedEvidence, runbooks: preparedRunbooks}, nil
+}
+
+func containsUnredactedSecret(content string) bool {
+	for _, match := range regexp.MustCompile(secretPatternExpression).FindAllStringSubmatch(content, -1) {
+		if len(match) != 2 || match[1] != "[REDACTED]" {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Graph) buildPrompt(input preparedInput) (string, error) {

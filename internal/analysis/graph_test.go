@@ -119,6 +119,37 @@ func TestGraph_PlaintextSecretNeverReachesModel(t *testing.T) {
 	}
 }
 
+func TestGraph_CanonicalRedactedSecretReachesModel(t *testing.T) {
+	spy := &spyModel{response: llmResponse(analysisJSON(t, contract.AnalysisResult{
+		SchemaVersion:              contract.SchemaVersionV1,
+		IncidentID:                 "incident-1",
+		Hypotheses:                 []contract.Hypothesis{{Summary: "health failed", EvidenceRefs: []string{"evidence-1"}}},
+		EvidenceRefs:               []string{"evidence-1"},
+		ConfidenceLabels:           []contract.ConfidenceLabel{contract.ConfidenceLow},
+		NotificationRecommendation: contract.NotificationNotify,
+	}))}
+	input := goldenInput()
+	input.Evidence[0].Content = "password=[REDACTED] Authorization: Bearer [REDACTED]"
+	input.Evidence[0].Reference.ByteCount = len(input.Evidence[0].Content)
+
+	outcome := newGraph(t, spy).Analyze(context.Background(), input)
+	if outcome.Status != StatusComplete || spy.calls != 1 {
+		t.Fatalf("Analyze() = %#v, model calls=%d, want complete redacted analysis", outcome, spy.calls)
+	}
+}
+
+func TestGraph_RedactionMarkerWithSuffixNeverReachesModel(t *testing.T) {
+	spy := &spyModel{}
+	input := goldenInput()
+	input.Evidence[0].Content = "password=[REDACTED]synthetic-secret"
+	input.Evidence[0].Reference.ByteCount = len(input.Evidence[0].Content)
+
+	outcome := newGraph(t, spy).Analyze(context.Background(), input)
+	if outcome.Status != StatusUnavailable || outcome.UnavailableCode != "invalid_input" || spy.calls != 0 {
+		t.Fatalf("Analyze() = %#v, model calls=%d, want invalid-input fallback", outcome, spy.calls)
+	}
+}
+
 func TestGraph_RejectsSecretInputWithoutTelemetryLeak(t *testing.T) {
 	golden := analysisJSON(t, contract.AnalysisResult{SchemaVersion: contract.SchemaVersionV1, IncidentID: "incident-1", Hypotheses: []contract.Hypothesis{{Summary: "health check failed", EvidenceRefs: []string{"evidence-1"}}}, EvidenceRefs: []string{"evidence-1"}, ConfidenceLabels: []contract.ConfidenceLabel{contract.ConfidenceHigh}, NotificationRecommendation: contract.NotificationNotify, CandidateRunbookIDs: []string{"restart-web"}})
 	fake, err := llm.NewFake("fake", []llm.FakeEvent{{Response: llmResponse(golden)}})
