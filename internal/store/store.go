@@ -17,7 +17,7 @@ import (
 const (
 	// CurrentSchemaVersion is the newest local-state schema supported by this
 	// binary. Future schema changes must append a transactional migration.
-	CurrentSchemaVersion uint32 = 3
+	CurrentSchemaVersion uint32 = 4
 
 	dataFileMode os.FileMode = 0o600
 )
@@ -83,6 +83,8 @@ const (
 	BucketServiceTargets Bucket = "service_targets"
 	// BucketRunbooks holds registered, canonical-digested runbook pairs.
 	BucketRunbooks Bucket = "runbooks"
+	// BucketIngressReceipts holds bounded, expiring accepted webhook IDs.
+	BucketIngressReceipts Bucket = "ingress_receipts"
 )
 
 var initialDataBuckets = []Bucket{
@@ -96,7 +98,7 @@ var initialDataBuckets = []Bucket{
 	BucketDeliveryQueue,
 }
 
-var dataBuckets = append(append([]Bucket(nil), initialDataBuckets...), BucketServiceTargets, BucketRunbooks)
+var dataBuckets = append(append([]Bucket(nil), initialDataBuckets...), BucketServiceTargets, BucketRunbooks, BucketIngressReceipts)
 
 var allowedBuckets = func() map[Bucket]struct{} {
 	buckets := make(map[Bucket]struct{}, len(dataBuckets))
@@ -159,7 +161,8 @@ type migration struct {
 var defaultMigrations = []migration{
 	{from: 0, to: 1, apply: applyInitialMigration},
 	{from: 1, to: 2, apply: applyServiceTargetMigration},
-	{from: 2, to: CurrentSchemaVersion, apply: applyRunbookMigration},
+	{from: 2, to: 3, apply: applyRunbookMigration},
+	{from: 3, to: CurrentSchemaVersion, apply: applyIngressReceiptMigration},
 }
 
 // Open opens a daemon-owned local store, applies supported migrations, and
@@ -587,6 +590,11 @@ func applyServiceTargetMigration(transaction *bbolt.Tx) error {
 
 func applyRunbookMigration(transaction *bbolt.Tx) error {
 	_, err := transaction.CreateBucketIfNotExists([]byte(BucketRunbooks))
+	return err
+}
+
+func applyIngressReceiptMigration(transaction *bbolt.Tx) error {
+	_, err := transaction.CreateBucketIfNotExists([]byte(BucketIngressReceipts))
 	return err
 }
 
