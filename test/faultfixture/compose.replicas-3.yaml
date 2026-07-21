@@ -1,0 +1,4 @@
+services:
+  fault-fixture:
+    deploy:
+      replicas: 3
