@@ -252,6 +252,35 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]ReconciliationResult, er
 	return results, nil
 }
 
+// Resume executes one locally granted command after loading the current
+// daemon-owned state. A command without a durable local grant remains in the
+// approval wait state and never reaches the Docker adapter.
+func (c *Coordinator) Resume(ctx context.Context, commandID string) (Result, error) {
+	if c == nil || ctx == nil || !validToken(commandID, maxCommandIDLength) {
+		return Result{}, ErrInvalidRequest
+	}
+	var stored storedRecord
+	found := false
+	err := c.state.View(func(transaction *store.Tx) error {
+		var err error
+		stored, found, err = findRecordByCommandID(transaction, commandID)
+		return err
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("read recovery command: %w", err)
+	}
+	if !found {
+		return Result{}, ErrInvalidRequest
+	}
+	if stored.record.Phase == phaseAwaitingApproval && stored.record.Command.State == contract.RecoveryPending {
+		if stored.record.Command.ApprovalID == "" {
+			return Result{Command: stored.record.Command, Outcome: OutcomeAwaitApproval}, nil
+		}
+		return c.execute(ctx, stored.record)
+	}
+	return Result{Command: stored.record.Command, Outcome: existingOutcome(stored.record), Duplicate: true}, nil
+}
+
 func (c *Coordinator) prepare(request Request, now time.Time) (journalRecord, bool, policy.Decision, error) {
 	commandID, err := c.newCommandID()
 	if err != nil {
@@ -339,8 +368,10 @@ func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result
 		return c.denyAfterRevalidation(record, decision, nil)
 	}
 
-	if _, err := c.approve(recordKey(record.Command)); err != nil {
-		return Result{}, err
+	if record.Phase != phaseApproved {
+		if _, err := c.approve(recordKey(record.Command)); err != nil {
+			return Result{}, err
+		}
 	}
 	executing, err := c.startExecution(recordKey(record.Command))
 	if err != nil {

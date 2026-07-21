@@ -33,6 +33,7 @@ type fakeAdminClient struct {
 	registerRunbook func(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
 	listIncidents   func(context.Context, string, string, incident.Filter) (incident.Page, error)
 	showIncident    func(context.Context, string, string, string) (contract.Incident, error)
+	decideApproval  func(context.Context, string, string, string, contract.ApprovalDecision, time.Time) (adminipc.ApprovalResult, error)
 }
 
 func (c fakeAdminClient) ListIncidents(ctx context.Context, socketPath, reason string, filter incident.Filter) (incident.Page, error) {
@@ -46,6 +47,13 @@ func (c fakeAdminClient) ShowIncident(ctx context.Context, socketPath, reason, i
 		return contract.Incident{}, errors.New("unexpected incident show")
 	}
 	return c.showIncident(ctx, socketPath, reason, id)
+}
+
+func (c fakeAdminClient) DecideApproval(ctx context.Context, socketPath, reason, commandID string, decision contract.ApprovalDecision, expiresAt time.Time) (adminipc.ApprovalResult, error) {
+	if c.decideApproval == nil {
+		return adminipc.ApprovalResult{}, errors.New("unexpected approval decision")
+	}
+	return c.decideApproval(ctx, socketPath, reason, commandID, decision, expiresAt)
 }
 
 func (c fakeAdminClient) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
@@ -131,50 +139,52 @@ func TestExecute_IncidentListUsesDaemonClient(t *testing.T) {
 	}
 }
 
-func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing.T) {
+func TestExecute_ApprovalRoutesThroughDaemonClient(t *testing.T) {
+	expiresAt := time.Date(2026, time.July, 21, 1, 0, 0, 0, time.UTC)
 	tests := []struct {
-		name string
-		args []string
+		name     string
+		decision contract.ApprovalDecision
 	}{
-		{name: "approval grant", args: []string{"approval", "grant"}},
-		{name: "approval deny", args: []string{"approval", "deny"}},
+		{name: "grant", decision: contract.ApprovalGranted},
+		{name: "deny", decision: contract.ApprovalDenied},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var stdout bytes.Buffer
 			var stderr bytes.Buffer
-
-			exitCode := execute(
+			called := false
+			exitCode := executeWithDependencies(
 				context.Background(),
-				tt.args,
+				[]string{"approval", string(tt.decision), "--config", "config.json", "--command-id", "command-1", "--expires-at", expiresAt.Format(time.RFC3339), "--reason", "operator_requested"},
 				&stdout,
 				&stderr,
 				runnerFunc(func(context.Context) error { return nil }),
+				func(string) (config.Config, error) {
+					return config.Config{Admin: config.AdminConfig{SocketPath: "/tmp/pulse-agent/admin.sock"}}, nil
+				},
+				fakeAdminClient{decideApproval: func(_ context.Context, socketPath, reason, commandID string, decision contract.ApprovalDecision, gotExpiresAt time.Time) (adminipc.ApprovalResult, error) {
+					called = socketPath == "/tmp/pulse-agent/admin.sock" && reason == "operator_requested" && commandID == "command-1" && decision == tt.decision && gotExpiresAt.Equal(expiresAt)
+					state := contract.RecoveryPending
+					if decision == contract.ApprovalDenied {
+						state = contract.RecoveryDenied
+					}
+					return adminipc.ApprovalResult{SchemaVersion: adminipc.SchemaVersion, ApprovalID: "approval-1", CommandID: commandID, Decision: decision, CommandState: state, ExpiresAt: gotExpiresAt}, nil
+				}},
 			)
 
-			if exitCode != ExitNotImplemented {
-				t.Fatalf("execute() exit code = %d, want %d", exitCode, ExitNotImplemented)
+			if exitCode != ExitSuccess {
+				t.Fatalf("execute() exit code = %d, want %d; stderr = %s", exitCode, ExitSuccess, stderr.String())
 			}
-			if stdout.Len() != 0 {
-				t.Fatalf("execute() stdout = %q, want empty", stdout.String())
+			if !called {
+				t.Fatal("approval did not use daemon client")
 			}
-
-			var got diagnostic
-			if err := json.Unmarshal(stderr.Bytes(), &got); err != nil {
-				t.Fatalf("decode diagnostic %q: %v", stderr.String(), err)
+			var result adminipc.ApprovalResult
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				t.Fatalf("decode approval result %q: %v", stdout.String(), err)
 			}
-			if got.SchemaVersion != errorSchemaVersion {
-				t.Errorf("schema version = %q, want %q", got.SchemaVersion, errorSchemaVersion)
-			}
-			if got.Error.Code != "not_implemented" {
-				t.Errorf("error code = %q, want %q", got.Error.Code, "not_implemented")
-			}
-			if got.Error.Command != tt.name {
-				t.Errorf("error command = %q, want %q", got.Error.Command, tt.name)
-			}
-			if got.Error.Retryable {
-				t.Error("error retryable = true, want false")
+			if result.Decision != tt.decision {
+				t.Errorf("decision = %q, want %q", result.Decision, tt.decision)
 			}
 		})
 	}
