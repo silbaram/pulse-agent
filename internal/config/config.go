@@ -19,11 +19,12 @@ const (
 	// SchemaVersion is the supported configuration schema version.
 	SchemaVersion = contract.SchemaVersionV1
 	// MaxDocumentBytes is the largest accepted standalone configuration document.
-	MaxDocumentBytes  = contract.MaxDocumentBytes
-	maxAllowedTargets = 10_000
-	maxRetentionAge   = 365 * 24 * time.Hour
-	maxRetentionBytes = 1 << 40
-	maxGeminiTimeout  = 2 * time.Minute
+	MaxDocumentBytes   = contract.MaxDocumentBytes
+	maxAllowedTargets  = 10_000
+	maxRetentionAge    = 365 * 24 * time.Hour
+	maxRetentionBytes  = 1 << 40
+	maxGeminiTimeout   = 2 * time.Minute
+	maxAdminIdentities = 1_024
 )
 
 var (
@@ -80,7 +81,9 @@ type DockerConfig struct {
 
 // AdminConfig identifies the daemon-owned local administrative socket path.
 type AdminConfig struct {
-	SocketPath string `json:"socket_path"`
+	SocketPath  string   `json:"socket_path"`
+	AllowedUIDs []uint32 `json:"allowed_uids"`
+	AllowedGIDs []uint32 `json:"allowed_gids"`
 }
 
 // LimitsConfig bounds target registration and locally retained evidence.
@@ -149,6 +152,9 @@ func (c Config) Validate() error {
 	}
 	if !isContainedCleanPath(c.DataDirectory, c.EvidenceDirectory) || !isContainedCleanPath(c.DataDirectory, c.Admin.SocketPath) {
 		return ErrInvalidConfig
+	}
+	if err := c.Admin.validate(); err != nil {
+		return err
 	}
 	if !isUnixSocketEndpoint(c.Docker.Endpoint) {
 		return ErrInvalidConfig
@@ -225,6 +231,27 @@ func isUnixSocketEndpoint(value string) bool {
 		return false
 	}
 	return isAbsoluteCleanPath(endpoint.Path)
+}
+
+func (c AdminConfig) validate() error {
+	if err := validateIdentityList(c.AllowedUIDs); err != nil {
+		return err
+	}
+	return validateIdentityList(c.AllowedGIDs)
+}
+
+func validateIdentityList(identities []uint32) error {
+	if len(identities) == 0 || len(identities) > maxAdminIdentities {
+		return ErrInvalidConfig
+	}
+	seen := make(map[uint32]struct{}, len(identities))
+	for _, identity := range identities {
+		if _, duplicate := seen[identity]; duplicate {
+			return ErrInvalidConfig
+		}
+		seen[identity] = struct{}{}
+	}
+	return nil
 }
 
 func validateAllowedTargets(targets []AllowedTarget, maxTargets int) error {

@@ -7,7 +7,9 @@
     "endpoint": "unix:///var/run/docker.sock"
   },
   "admin": {
-    "socket_path": "/tmp/pulse-agent/admin.sock"
+    "socket_path": "/tmp/pulse-agent/admin.sock",
+    "allowed_uids": [1000],
+    "allowed_gids": [1000]
   },
   "limits": {
     "max_targets": 1,

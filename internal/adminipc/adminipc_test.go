@@ -1,0 +1,446 @@
+package adminipc
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"pulse-agent/internal/contract"
+	"pulse-agent/internal/store"
+)
+
+var authorizedTestActor = Actor{UID: 1000, GID: 1000}
+
+func TestServer_StatusAndBackupAuditAuthenticatedActor(t *testing.T) {
+	state := openTestStore(t)
+	server, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatalf("Lstat() daemon socket: %v", err)
+	}
+	if info.Mode().Perm()&^socketMode != 0 {
+		t.Errorf("socket mode = %#o, want no bits outside %#o", info.Mode().Perm(), socketMode)
+	}
+	if !server.socketIsCurrent() {
+		t.Fatal("daemon socket did not retain its expected owner, group, and inode")
+	}
+	client := &Client{requestTimeout: time.Second}
+
+	status, err := client.Status(context.Background(), socketPath, "operator_status")
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if status.State != StatusRunning {
+		t.Errorf("status state = %q, want %q", status.State, StatusRunning)
+	}
+	if len(status.Capabilities) != 1 || status.Capabilities[0] != statusCapabilityAdminIPC {
+		t.Errorf("status capabilities = %#v, want admin IPC capability", status.Capabilities)
+	}
+
+	var snapshot bytes.Buffer
+	if err := client.Backup(context.Background(), socketPath, "routine_backup", &snapshot); err != nil {
+		t.Fatalf("Backup() error = %v", err)
+	}
+	if snapshot.Len() == 0 {
+		t.Fatal("Backup() returned an empty snapshot")
+	}
+	var expected bytes.Buffer
+	if err := state.Backup(&expected); err != nil {
+		t.Fatalf("Store.Backup() error = %v", err)
+	}
+	if !bytes.Equal(snapshot.Bytes(), expected.Bytes()) {
+		t.Fatal("Backup() did not return the daemon-owned state snapshot")
+	}
+
+	events := readAuditEvents(t, state)
+	if len(events) != 2 {
+		t.Fatalf("audit event count = %d, want 2", len(events))
+	}
+	assertAuditEvent(t, events[0], auditActionStatus, auditResultAccepted, "operator_status")
+	assertAuditEvent(t, events[1], auditActionBackup, auditResultAccepted, "routine_backup")
+	for _, event := range events {
+		if event.ActorIdentity != authorizedTestActor.Identity() {
+			t.Errorf("audit actor identity = %q, want %q", event.ActorIdentity, authorizedTestActor.Identity())
+		}
+	}
+
+	stop()
+}
+
+func TestServer_RejectsUnauthorizedPeerAndAuditsRejection(t *testing.T) {
+	state := openTestStore(t)
+	unauthorized := Actor{UID: authorizedTestActor.UID + 1, GID: authorizedTestActor.GID}
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return unauthorized, nil
+	})
+	client := &Client{requestTimeout: time.Second}
+
+	_, err := client.Status(context.Background(), socketPath, "operator_status")
+	if !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("Status() error = %v, want %v", err, ErrRequestRejected)
+	}
+
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	assertAuditEvent(t, events[0], auditActionRequest, auditResultRejected, auditReasonUnauthorized)
+	if events[0].ActorIdentity != unauthorized.Identity() {
+		t.Errorf("audit actor identity = %q, want %q", events[0].ActorIdentity, unauthorized.Identity())
+	}
+
+	stop()
+}
+
+func TestServer_RejectsMalformedRequestBeforeRouting(t *testing.T) {
+	state := openTestStore(t)
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	connection := dialTestSocket(t, socketPath)
+	defer connection.Close()
+
+	if _, err := io.WriteString(connection, `{"schema_version":"v1","request_id":"request-1","operation":"status","reason_code":"operator_status","unexpected":true}`+"\n"); err != nil {
+		t.Fatalf("write malformed request: %v", err)
+	}
+	response := readTestResponse(t, connection)
+	if response.Result != resultFailure || response.ErrorCode != errorMalformedRequest {
+		t.Errorf("malformed response = %#v, want malformed request failure", response)
+	}
+
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	assertAuditEvent(t, events[0], auditActionRequest, auditResultRejected, auditReasonMalformed)
+
+	stop()
+}
+
+func TestClient_RejectsAbsentAndSymlinkSocket(t *testing.T) {
+	client := &Client{requestTimeout: time.Second}
+	socketPath := filepath.Join(t.TempDir(), "admin.sock")
+
+	_, err := client.Status(context.Background(), socketPath, "operator_status")
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Fatalf("Status() absent socket error = %v, want %v", err, ErrDaemonUnavailable)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "target"), socketPath); err != nil {
+		t.Fatalf("create socket symlink: %v", err)
+	}
+	_, err = client.Status(context.Background(), socketPath, "operator_status")
+	if !errors.Is(err, ErrInsecureSocket) {
+		t.Fatalf("Status() symlink error = %v, want %v", err, ErrInsecureSocket)
+	}
+}
+
+func TestServer_RefusesExistingPathAndPreservesIt(t *testing.T) {
+	state := openTestStore(t)
+	socketPath := filepath.Join(t.TempDir(), "admin.sock")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "target"), socketPath); err != nil {
+		t.Fatalf("create socket symlink: %v", err)
+	}
+	server := newTestServer(t, state, socketPath, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+
+	err := server.Serve(context.Background())
+	if !errors.Is(err, ErrSocketPathExists) {
+		t.Fatalf("Serve() error = %v, want %v", err, ErrSocketPathExists)
+	}
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatalf("Lstat() after refused startup: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("Serve() replaced the existing symlink")
+	}
+}
+
+func TestServer_PreservesReplacementDuringShutdown(t *testing.T) {
+	state := openTestStore(t)
+	server, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatalf("remove daemon socket for replacement test: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "replacement"), socketPath); err != nil {
+		t.Fatalf("replace socket with symlink: %v", err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	stop()
+
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatalf("Lstat() replacement after shutdown: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("Close() removed the replacement path")
+	}
+}
+
+func TestServer_HandlesConcurrentRequestsAndGracefulShutdown(t *testing.T) {
+	state := openTestStore(t)
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	})
+	client := &Client{requestTimeout: time.Second}
+
+	const requestCount = 24
+	errorsByRequest := make(chan error, requestCount)
+	var requests sync.WaitGroup
+	for range requestCount {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			_, err := client.Status(context.Background(), socketPath, "parallel_status")
+			errorsByRequest <- err
+		}()
+	}
+	requests.Wait()
+	close(errorsByRequest)
+	for err := range errorsByRequest {
+		if err != nil {
+			t.Errorf("concurrent Status() error = %v", err)
+		}
+	}
+
+	events := readAuditEvents(t, state)
+	if len(events) != requestCount {
+		t.Fatalf("audit event count = %d, want %d", len(events), requestCount)
+	}
+	stop()
+	if _, err := os.Lstat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("socket after graceful shutdown error = %v, want not exist", err)
+	}
+}
+
+func TestServer_TimeoutAndCancellationCloseIncompleteConnections(t *testing.T) {
+	state := openTestStore(t)
+	accepted := make(chan struct{}, 2)
+	_, socketPath, stop := startTestServer(t, state, 25*time.Millisecond, func(*net.UnixConn) (Actor, error) {
+		accepted <- struct{}{}
+		return authorizedTestActor, nil
+	})
+
+	timeoutConnection := dialTestSocket(t, socketPath)
+	defer timeoutConnection.Close()
+	awaitSignal(t, accepted, "server did not accept timeout connection")
+	if err := timeoutConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set timeout connection read deadline: %v", err)
+	}
+	var oneByte [1]byte
+	if _, err := timeoutConnection.Read(oneByte[:]); err == nil {
+		t.Fatal("incomplete request stayed open after server timeout")
+	}
+
+	cancelConnection := dialTestSocket(t, socketPath)
+	defer cancelConnection.Close()
+	awaitSignal(t, accepted, "server did not accept cancellation connection")
+	if err := cancelConnection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set cancellation connection read deadline: %v", err)
+	}
+	stop()
+	if _, err := cancelConnection.Read(oneByte[:]); err == nil {
+		t.Fatal("incomplete request stayed open after graceful shutdown")
+	}
+}
+
+func TestClient_ContextCancellationClosesPendingRequest(t *testing.T) {
+	state := openTestStore(t)
+	credentialsStarted := make(chan struct{}, 1)
+	releaseCredentials := make(chan struct{})
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		credentialsStarted <- struct{}{}
+		<-releaseCredentials
+		return authorizedTestActor, nil
+	})
+	client := &Client{requestTimeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Status(ctx, socketPath, "operator_status")
+		result <- err
+	}()
+
+	awaitSignal(t, credentialsStarted, "server did not begin the pending request")
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Status() cancellation error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Status() did not return after context cancellation")
+	}
+	close(releaseCredentials)
+	stop()
+}
+
+func openTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	state, err := store.Open(store.Options{
+		Path:        filepath.Join(t.TempDir(), "state.db"),
+		LockTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := state.Close(); err != nil {
+			t.Errorf("Store.Close() error = %v", err)
+		}
+	})
+	return state
+}
+
+func startTestServer(t *testing.T, state *store.Store, timeout time.Duration, credentials PeerCredentials) (*Server, string, func()) {
+	t.Helper()
+	socketPath := testSocketPath(t)
+	server := newTestServer(t, state, socketPath, timeout, credentials)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- server.Serve(ctx)
+	}()
+	waitForSocket(t, server, socketPath, result)
+
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Errorf("Server.Serve() error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Error("Server.Serve() did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return server, socketPath, stop
+}
+
+func testSocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/private/tmp", "pulse-agent-ipc-")
+	if err != nil {
+		t.Fatalf("create short socket directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove short socket directory: %v", err)
+		}
+	})
+	return filepath.Join(directory, "admin.sock")
+}
+
+func newTestServer(t *testing.T, state *store.Store, socketPath string, timeout time.Duration, credentials PeerCredentials) *Server {
+	t.Helper()
+	server, err := NewServer(Options{
+		SocketPath:      socketPath,
+		AllowedUIDs:     []uint32{authorizedTestActor.UID},
+		AllowedGIDs:     []uint32{authorizedTestActor.GID},
+		State:           state,
+		RequestTimeout:  timeout,
+		PeerCredentials: credentials,
+	})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+	return server
+}
+
+func waitForSocket(t *testing.T, server *Server, socketPath string, result <-chan error) {
+	t.Helper()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		info, err := os.Lstat(socketPath)
+		if err == nil && info.Mode()&os.ModeSocket != 0 && info.Mode().Perm()&^socketMode == 0 && server.socketIsCurrent() {
+			return
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("server stopped before socket became available: %v", err)
+		case <-timeout.C:
+			t.Fatalf("socket %q did not become available; Lstat error = %v", socketPath, err)
+		case <-ticker.C:
+		}
+	}
+}
+
+func dialTestSocket(t *testing.T, socketPath string) *net.UnixConn {
+	t.Helper()
+	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatalf("DialUnix(%q) error = %v", socketPath, err)
+	}
+	return connection
+}
+
+func readTestResponse(t *testing.T, connection *net.UnixConn) response {
+	t.Helper()
+	document, err := readMessage(bufioReader(connection))
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	decoded, err := decodeResponse(document)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return decoded
+}
+
+func readAuditEvents(t *testing.T, state *store.Store) []contract.AuditEvent {
+	t.Helper()
+	var events []contract.AuditEvent
+	err := state.View(func(transaction *store.Tx) error {
+		return transaction.ForEach(store.BucketAudit, func(_ string, document []byte) error {
+			var event contract.AuditEvent
+			if err := json.Unmarshal(document, &event); err != nil {
+				return err
+			}
+			events = append(events, event)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("read audit events: %v", err)
+	}
+	return events
+}
+
+func assertAuditEvent(t *testing.T, event contract.AuditEvent, action, outcome, reason string) {
+	t.Helper()
+	if event.Action != action || event.Result != outcome || event.ReasonCode != reason {
+		t.Errorf("audit event = action %q, result %q, reason %q; want action %q, result %q, reason %q", event.Action, event.Result, event.ReasonCode, action, outcome, reason)
+	}
+}
+
+func awaitSignal(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatal(message)
+	}
+}

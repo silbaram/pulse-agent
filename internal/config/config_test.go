@@ -61,6 +61,44 @@ func TestDecode_RejectsDuplicateFields(t *testing.T) {
 	}
 }
 
+func TestConfig_ValidateRejectsMissingOrDuplicateAdminIdentities(t *testing.T) {
+	document, err := os.ReadFile(filepath.Join("testdata", "valid-production.json"))
+	if err != nil {
+		t.Fatalf("read valid fixture: %v", err)
+	}
+	valid, err := Decode(document)
+	if err != nil {
+		t.Fatalf("Decode() valid fixture error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "missing allowed UID list",
+			mutate: func(value *Config) {
+				value.Admin.AllowedUIDs = nil
+			},
+		},
+		{
+			name: "duplicate allowed GID",
+			mutate: func(value *Config) {
+				value.Admin.AllowedGIDs = []uint32{1000, 1000}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := valid
+			tt.mutate(&value)
+			if err := value.Validate(); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("Validate() error = %v, want %v", err, ErrInvalidConfig)
+			}
+		})
+	}
+}
+
 func TestLoad_RejectsOversizeDocument(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oversize.json")
 	document := []byte(strings.Repeat("x", MaxDocumentBytes+1))

@@ -358,11 +358,28 @@ func (s *Store) CheckIntegrity() error {
 // Backup writes a consistent raw bbolt snapshot from a managed read-only
 // transaction. The daemon remains the only process with the live file handle.
 func (s *Store) Backup(destination io.Writer) error {
+	return s.BackupWithSize(destination, nil)
+}
+
+// BackupWithSize writes a consistent raw bbolt snapshot after calling ready
+// with the exact byte count that will be written. The callback runs inside the
+// same read-only transaction as the snapshot, so a transport can safely send
+// framing before the raw database bytes without reopening the live file.
+func (s *Store) BackupWithSize(destination io.Writer, ready func(int64) error) error {
 	if s == nil || s.db == nil || destination == nil {
 		return ErrInvalidOptions
 	}
 	err := s.db.View(func(transaction *bbolt.Tx) error {
-		_, err := transaction.WriteTo(destination)
+		size := transaction.Size()
+		if ready != nil {
+			if err := ready(size); err != nil {
+				return err
+			}
+		}
+		written, err := transaction.WriteTo(destination)
+		if err == nil && written != size {
+			return io.ErrShortWrite
+		}
 		return err
 	})
 	return normalizeError(err)

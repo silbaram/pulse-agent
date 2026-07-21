@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/standalone"
 )
@@ -43,6 +44,15 @@ type standaloneRunner interface {
 	Run(context.Context) error
 }
 
+type configuredStandaloneRunner interface {
+	RunWithConfig(context.Context, config.Config) error
+}
+
+type adminClient interface {
+	Status(context.Context, string, string) (adminipc.Status, error)
+	Backup(context.Context, string, string, io.Writer) error
+}
+
 type configLoader func(string) (config.Config, error)
 
 type diagnostic struct {
@@ -64,7 +74,7 @@ type configValidation struct {
 
 // Execute runs the requested command and returns its process exit code.
 func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return executeWithConfig(ctx, args, stdout, stderr, standalone.New(), config.Load)
+	return executeWithDependencies(ctx, args, stdout, stderr, standalone.New(), config.Load, adminipc.NewClient())
 }
 
 func execute(
@@ -74,7 +84,7 @@ func execute(
 	stderr io.Writer,
 	service standaloneRunner,
 ) int {
-	return executeWithConfig(ctx, args, stdout, stderr, service, config.Load)
+	return executeWithDependencies(ctx, args, stdout, stderr, service, config.Load, adminipc.NewClient())
 }
 
 func executeWithConfig(
@@ -84,6 +94,18 @@ func executeWithConfig(
 	stderr io.Writer,
 	service standaloneRunner,
 	loadConfig configLoader,
+) int {
+	return executeWithDependencies(ctx, args, stdout, stderr, service, loadConfig, adminipc.NewClient())
+}
+
+func executeWithDependencies(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	service standaloneRunner,
+	loadConfig configLoader,
+	client adminClient,
 ) int {
 	if len(args) == 0 {
 		writeTopLevelUsage(stderr)
@@ -104,7 +126,7 @@ func executeWithConfig(
 	}
 
 	if _, ok := directCommands[args[0]]; ok {
-		return executeRecognized(args, stdout, stderr)
+		return executeAdmin(ctx, args, stdout, stderr, loadConfig, client)
 	}
 
 	if subcommands, ok := commandGroups[args[0]]; ok {
@@ -129,11 +151,17 @@ func executeStandalone(
 	if len(args) != 3 || args[1] != "--config" || args[2] == "" {
 		return writeError(stderr, ExitUsage, "invalid_arguments", "standalone", "standalone requires --config <path>")
 	}
-	if _, err := loadConfig(args[2]); err != nil {
+	runtimeConfig, err := loadConfig(args[2])
+	if err != nil {
 		return writeError(stderr, ExitFailure, "config_invalid", "standalone", "configuration validation failed")
 	}
 
-	if err := service.Run(ctx); err != nil {
+	if configured, ok := service.(configuredStandaloneRunner); ok {
+		err = configured.RunWithConfig(ctx, runtimeConfig)
+	} else {
+		err = service.Run(ctx)
+	}
+	if err != nil {
 		return writeError(stderr, ExitFailure, "standalone_failed", "standalone", err.Error())
 	}
 	return ExitSuccess
@@ -164,16 +192,75 @@ func executeConfig(args []string, stdout, stderr io.Writer, loadConfig configLoa
 	return writeConfigValidation(stdout)
 }
 
-func executeRecognized(args []string, stdout, stderr io.Writer) int {
+func executeAdmin(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	loadConfig configLoader,
+	client adminClient,
+) int {
 	commandName := args[0]
 	if len(args) == 2 && isHelp(args[1]) {
-		fmt.Fprintf(stdout, "Usage: pulse-agent %s\n", commandName)
+		fmt.Fprintf(stdout, "Usage: pulse-agent %s --config <path> [--reason <code>]\n", commandName)
 		return ExitSuccess
 	}
-	if len(args) != 1 {
-		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "command does not accept arguments yet")
+	configPath, reasonCode, ok := parseAdminArguments(args)
+	if !ok {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "command requires --config <path> with optional --reason <code>")
 	}
-	return writeNotImplemented(stderr, commandName)
+	runtimeConfig, err := loadConfig(configPath)
+	if err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", commandName, "configuration validation failed")
+	}
+
+	switch commandName {
+	case "status":
+		status, err := client.Status(ctx, runtimeConfig.Admin.SocketPath, reasonCode)
+		if err != nil {
+			return writeAdminRequestError(stderr, commandName, err)
+		}
+		return writeStatus(stdout, status)
+	case "backup":
+		if err := client.Backup(ctx, runtimeConfig.Admin.SocketPath, reasonCode, stdout); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			return writeAdminRequestError(stderr, commandName, err)
+		}
+		return ExitSuccess
+	default:
+		return writeError(stderr, ExitUsage, "unknown_command", commandName, "unknown command")
+	}
+}
+
+func parseAdminArguments(args []string) (configPath, reasonCode string, ok bool) {
+	if len(args) != 3 && len(args) != 5 {
+		return "", "", false
+	}
+	if args[1] != "--config" || args[2] == "" {
+		return "", "", false
+	}
+	if len(args) == 3 {
+		return args[2], adminipc.DefaultReasonCode, true
+	}
+	if args[3] != "--reason" || args[4] == "" {
+		return "", "", false
+	}
+	return args[2], args[4], true
+}
+
+func writeAdminRequestError(stderr io.Writer, commandName string, err error) int {
+	if errors.Is(err, adminipc.ErrInvalidOptions) {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "invalid administrative request")
+	}
+	return writeError(stderr, ExitFailure, "daemon_unavailable", commandName, "administrative daemon request failed")
+}
+
+func writeStatus(stdout io.Writer, status adminipc.Status) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(status); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
 }
 
 func executeGroup(

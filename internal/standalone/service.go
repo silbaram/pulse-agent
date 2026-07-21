@@ -4,11 +4,21 @@ package standalone
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"pulse-agent/internal/adminipc"
+	"pulse-agent/internal/config"
+	"pulse-agent/internal/store"
 )
 
-const defaultShutdownTimeout = 10 * time.Second
+const (
+	defaultShutdownTimeout  = 10 * time.Second
+	defaultStoreLockTimeout = time.Second
+	stateFileName           = "state.db"
+)
 
 var (
 	// ErrAlreadyStarted indicates that a Service was run more than once.
@@ -49,6 +59,50 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
+	return s.drain()
+}
+
+// RunWithConfig opens daemon-owned local state, serves protected
+// administrative IPC, and drains any admitted standalone work at shutdown.
+func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config) (runErr error) {
+	if err := runtimeConfig.Validate(); err != nil {
+		return err
+	}
+	state, err := store.Open(store.Options{
+		Path:        filepath.Join(runtimeConfig.DataDirectory, stateFileName),
+		LockTimeout: defaultStoreLockTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("open daemon-owned state: %w", err)
+	}
+	defer func() {
+		if closeErr := state.Close(); runErr == nil && closeErr != nil {
+			runErr = fmt.Errorf("close daemon-owned state: %w", closeErr)
+		}
+	}()
+
+	server, err := adminipc.NewServer(adminipc.Options{
+		SocketPath:  runtimeConfig.Admin.SocketPath,
+		AllowedUIDs: runtimeConfig.Admin.AllowedUIDs,
+		AllowedGIDs: runtimeConfig.Admin.AllowedGIDs,
+		State:       state,
+	})
+	if err != nil {
+		return fmt.Errorf("create administrative IPC server: %w", err)
+	}
+	if err := s.start(); err != nil {
+		return err
+	}
+
+	serveErr := server.Serve(ctx)
+	drainErr := s.drain()
+	if serveErr != nil {
+		return serveErr
+	}
+	return drainErr
+}
+
+func (s *Service) drain() error {
 	drained := s.stopAccepting()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
