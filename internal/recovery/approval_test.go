@@ -53,8 +53,8 @@ func TestApprovalManager_GrantIsAuditedAndReplayIsRejected(t *testing.T) {
 	if !errors.Is(err, ErrApprovalConflict) {
 		t.Fatalf("Decide(replay) error = %v, want %v", err, ErrApprovalConflict)
 	}
-	if result, err := coordinator.Resume(context.Background(), request.CommandID); err != nil || result.Outcome != OutcomeExecuted {
-		t.Fatalf("Resume() = %#v, %v, want executed after one local grant", result, err)
+	if result, err := coordinator.Resume(context.Background(), request.CommandID); err != nil || result.Outcome != OutcomeStabilizing {
+		t.Fatalf("Resume() = %#v, %v, want stabilizing after one local grant", result, err)
 	}
 
 	events := readApprovalAuditEvents(t, state)

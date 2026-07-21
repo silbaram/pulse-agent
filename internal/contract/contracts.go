@@ -175,6 +175,9 @@ const (
 	RecoveryApproved RecoveryCommandState = "approved"
 	// RecoveryExecuting identifies a command currently executing.
 	RecoveryExecuting RecoveryCommandState = "executing"
+	// RecoveryStabilizing identifies a command whose Docker operation returned
+	// successfully and now requires separate post-recovery verification.
+	RecoveryStabilizing RecoveryCommandState = "stabilizing"
 	// RecoverySucceeded identifies a successful command.
 	RecoverySucceeded RecoveryCommandState = "succeeded"
 	// RecoveryFailed identifies a failed command.
@@ -510,6 +513,8 @@ func (r RecoveryCommandState) CanTransitionTo(next RecoveryCommandState) bool {
 	case RecoveryApproved:
 		return next == RecoveryExecuting || next == RecoveryExpired
 	case RecoveryExecuting:
+		return next == RecoveryStabilizing || next == RecoveryFailed
+	case RecoveryStabilizing:
 		return next == RecoverySucceeded || next == RecoveryFailed
 	default:
 		return false
@@ -703,7 +708,7 @@ func terminalIncident(state IncidentState) bool {
 }
 
 func validRecoveryState(state RecoveryCommandState) bool {
-	return oneOf(string(state), string(RecoveryPending), string(RecoveryApproved), string(RecoveryExecuting), string(RecoverySucceeded), string(RecoveryFailed), string(RecoveryDenied), string(RecoveryExpired))
+	return oneOf(string(state), string(RecoveryPending), string(RecoveryApproved), string(RecoveryExecuting), string(RecoveryStabilizing), string(RecoverySucceeded), string(RecoveryFailed), string(RecoveryDenied), string(RecoveryExpired))
 }
 
 func validDeliveryState(state DeliveryState) bool {
