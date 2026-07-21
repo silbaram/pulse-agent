@@ -41,6 +41,8 @@ var (
 	ErrDeliveryConflict = errors.New("delivery identity conflict")
 	// ErrCorruptQueue indicates an invalid durable delivery queue entry.
 	ErrCorruptQueue = errors.New("corrupt delivery queue entry")
+	// ErrPayloadUnavailable indicates that no registered source owns a typed payload.
+	ErrPayloadUnavailable = errors.New("delivery payload source unavailable")
 )
 
 // Clock supplies deterministic enqueue, retry, and expiry timestamps.
@@ -60,6 +62,20 @@ type HTTPClient interface {
 type PayloadSource interface {
 	// Load returns the body to sign and send for one typed payload reference.
 	Load(context.Context, contract.DeliveryPayloadType, string) ([]byte, error)
+}
+
+// PayloadSources routes each bounded payload type to its daemon-owned source.
+// It lets the shared dispatcher deliver more than one persisted payload type
+// without learning package-specific storage details.
+type PayloadSources map[contract.DeliveryPayloadType]PayloadSource
+
+// Load delegates one exact payload request to its registered source.
+func (sources PayloadSources) Load(ctx context.Context, payloadType contract.DeliveryPayloadType, payloadRef string) ([]byte, error) {
+	source := sources[payloadType]
+	if source == nil {
+		return nil, ErrPayloadUnavailable
+	}
+	return source.Load(ctx, payloadType, payloadRef)
 }
 
 // Options configures one daemon-owned bounded delivery dispatcher.
@@ -255,6 +271,13 @@ func (d *Dispatcher) enqueue(request EnqueueRequest, mutation Mutation) (contrac
 		if _, found, err := transaction.Get(store.BucketDeliveryQueue, key); err != nil {
 			return err
 		} else if found {
+			return ErrDeliveryConflict
+		}
+		inUse, err := webhookIDInUse(transaction, item.WebhookID)
+		if err != nil {
+			return err
+		}
+		if inUse {
 			return ErrDeliveryConflict
 		}
 		return putItem(transaction, key, item)
@@ -540,6 +563,21 @@ func countPending(transaction *store.Tx) (int, error) {
 		return nil
 	})
 	return pending, err
+}
+
+func webhookIDInUse(transaction *store.Tx, webhookID string) (bool, error) {
+	inUse := false
+	err := transaction.ForEach(store.BucketDeliveryQueue, func(_ string, document []byte) error {
+		item, err := decodeItem(document)
+		if err != nil {
+			return err
+		}
+		if item.WebhookID == webhookID {
+			inUse = true
+		}
+		return nil
+	})
+	return inUse, err
 }
 
 func loadItem(transaction *store.Tx, key string) (contract.DeliveryQueueItem, error) {
