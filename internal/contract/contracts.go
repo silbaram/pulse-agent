@@ -580,6 +580,70 @@ type IncidentReport struct {
 	DeliveryStatus                DeliveryState  `json:"delivery_status"`
 }
 
+// Validate verifies the complete, secret-free terminal incident report shape.
+func (r IncidentReport) Validate() error {
+	if err := validateVersion(r.SchemaVersion); err != nil {
+		return err
+	}
+	if err := required("report_id", r.ReportID); err != nil {
+		return err
+	}
+	if err := required("incident_id", r.IncidentID); err != nil {
+		return err
+	}
+	if len(r.Hypotheses) == 0 || len(r.Hypotheses) > maxReferenceCount || len(r.EvidenceRefs) > maxReferenceCount || len(r.Actions) > maxReferenceCount || len(r.Approvals) > maxReferenceCount || len(r.PreventionRecommendations) == 0 || len(r.PreventionRecommendations) > maxReferenceCount || len(r.RunbookImprovementSuggestions) == 0 || len(r.RunbookImprovementSuggestions) > maxReferenceCount || !validDeliveryState(r.DeliveryStatus) {
+		return invalid("incident report")
+	}
+	if err := required("verification result", r.VerificationResult); err != nil {
+		return err
+	}
+	if err := required("postmortem draft", r.PostmortemDraft); err != nil {
+		return err
+	}
+	for _, hypothesis := range r.Hypotheses {
+		if err := required("report hypothesis summary", hypothesis.Summary); err != nil || len(hypothesis.EvidenceRefs) > maxReferenceCount {
+			return invalid("report hypothesis")
+		}
+		for _, reference := range hypothesis.EvidenceRefs {
+			if err := required("report hypothesis evidence reference", reference); err != nil {
+				return err
+			}
+		}
+	}
+	for _, reference := range r.EvidenceRefs {
+		if err := required("report evidence reference", reference); err != nil {
+			return err
+		}
+	}
+	for _, action := range r.Actions {
+		if err := required("report action command id", action.CommandID); err != nil {
+			return err
+		}
+		if !oneOf(string(action.ActionType), string(ActionDockerContainerRestart), string(ActionDockerComposeServiceRestart)) {
+			return invalid("report action type")
+		}
+		if err := required("report action result", action.Result); err != nil {
+			return err
+		}
+	}
+	for _, approval := range r.Approvals {
+		if err := required("report approval", approval); err != nil {
+			return err
+		}
+	}
+	for _, recommendation := range r.PreventionRecommendations {
+		if err := required("prevention recommendation", recommendation); err != nil {
+			return err
+		}
+	}
+	for _, suggestion := range r.RunbookImprovementSuggestions {
+		if err := required("runbook improvement suggestion", suggestion); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeliveryQueueItem is the shared queue contract for lifecycle events and
 // incident reports. It intentionally has no report_id-only branch.
 type DeliveryQueueItem struct {

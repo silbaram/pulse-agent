@@ -17,7 +17,7 @@ import (
 const (
 	// CurrentSchemaVersion is the newest local-state schema supported by this
 	// binary. Future schema changes must append a transactional migration.
-	CurrentSchemaVersion uint32 = 5
+	CurrentSchemaVersion uint32 = 6
 
 	dataFileMode os.FileMode = 0o600
 )
@@ -87,6 +87,8 @@ const (
 	BucketIngressReceipts Bucket = "ingress_receipts"
 	// BucketLifecycleEvents holds secret-free lifecycle payloads referenced by the delivery queue.
 	BucketLifecycleEvents Bucket = "lifecycle_events"
+	// BucketIncidentReports holds secret-free terminal incident payloads referenced by the delivery queue.
+	BucketIncidentReports Bucket = "incident_reports"
 )
 
 var initialDataBuckets = []Bucket{
@@ -100,7 +102,7 @@ var initialDataBuckets = []Bucket{
 	BucketDeliveryQueue,
 }
 
-var dataBuckets = append(append([]Bucket(nil), initialDataBuckets...), BucketServiceTargets, BucketRunbooks, BucketIngressReceipts, BucketLifecycleEvents)
+var dataBuckets = append(append([]Bucket(nil), initialDataBuckets...), BucketServiceTargets, BucketRunbooks, BucketIngressReceipts, BucketLifecycleEvents, BucketIncidentReports)
 
 var allowedBuckets = func() map[Bucket]struct{} {
 	buckets := make(map[Bucket]struct{}, len(dataBuckets))
@@ -165,7 +167,8 @@ var defaultMigrations = []migration{
 	{from: 1, to: 2, apply: applyServiceTargetMigration},
 	{from: 2, to: 3, apply: applyRunbookMigration},
 	{from: 3, to: 4, apply: applyIngressReceiptMigration},
-	{from: 4, to: CurrentSchemaVersion, apply: applyLifecycleEventMigration},
+	{from: 4, to: 5, apply: applyLifecycleEventMigration},
+	{from: 5, to: CurrentSchemaVersion, apply: applyIncidentReportMigration},
 }
 
 // Open opens a daemon-owned local store, applies supported migrations, and
@@ -603,6 +606,11 @@ func applyIngressReceiptMigration(transaction *bbolt.Tx) error {
 
 func applyLifecycleEventMigration(transaction *bbolt.Tx) error {
 	_, err := transaction.CreateBucketIfNotExists([]byte(BucketLifecycleEvents))
+	return err
+}
+
+func applyIncidentReportMigration(transaction *bbolt.Tx) error {
+	_, err := transaction.CreateBucketIfNotExists([]byte(BucketIncidentReports))
 	return err
 }
 
