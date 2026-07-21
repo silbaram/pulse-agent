@@ -9,6 +9,7 @@ import (
 	"io"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/target"
 )
 
 const (
@@ -64,6 +65,9 @@ const (
 	OperationStatus Operation = "status"
 	// OperationBackup streams a consistent daemon-owned local-state snapshot.
 	OperationBackup Operation = "backup"
+	// OperationTargetRegister submits one target document for daemon-owned
+	// validation, persistence, and audit.
+	OperationTargetRegister Operation = "target.register"
 )
 
 // StatusState identifies the lifecycle state returned by an administrative
@@ -84,7 +88,7 @@ type Actor struct {
 	GID uint32
 }
 
-// Identity returns the bounded audit-safe representation of a.
+// Identity returns the bounded audit-safe representation of the actor.
 func (a Actor) Identity() string {
 	return "uid:" + decimal(a.UID) + "/gid:" + decimal(a.GID)
 }
@@ -111,6 +115,8 @@ type Request struct {
 	Operation Operation `json:"operation"`
 	// ReasonCode is the bounded audit reason for the requested action.
 	ReasonCode string `json:"reason_code"`
+	// Target is present only for a target registration request.
+	Target *contract.ServiceTarget `json:"target,omitempty"`
 }
 
 type result string
@@ -121,17 +127,28 @@ const (
 )
 
 type response struct {
-	SchemaVersion string  `json:"schema_version"`
-	RequestID     string  `json:"request_id,omitempty"`
-	Result        result  `json:"result"`
-	ErrorCode     string  `json:"error_code,omitempty"`
-	Status        *Status `json:"status,omitempty"`
-	BackupSize    int64   `json:"backup_size,omitempty"`
+	SchemaVersion string                     `json:"schema_version"`
+	RequestID     string                     `json:"request_id,omitempty"`
+	Result        result                     `json:"result"`
+	ErrorCode     string                     `json:"error_code,omitempty"`
+	Status        *Status                    `json:"status,omitempty"`
+	BackupSize    int64                      `json:"backup_size,omitempty"`
+	TargetResult  *target.RegistrationResult `json:"target_result,omitempty"`
 }
 
 func (r Request) validate() error {
 	if r.SchemaVersion != SchemaVersion || !validRequestID(r.RequestID) || !validOperation(r.Operation) || !validReasonCode(r.ReasonCode) {
 		return ErrMalformedRequest
+	}
+	switch r.Operation {
+	case OperationTargetRegister:
+		if r.Target == nil || r.Target.SchemaVersion != SchemaVersion {
+			return ErrMalformedRequest
+		}
+	default:
+		if r.Target != nil {
+			return ErrMalformedRequest
+		}
 	}
 	return nil
 }
@@ -142,11 +159,11 @@ func (r response) validate() error {
 	}
 	switch r.Result {
 	case resultSuccess:
-		if r.ErrorCode != "" {
+		if r.ErrorCode != "" || responsePayloadCount(r) != 1 {
 			return ErrMalformedResponse
 		}
 	case resultFailure:
-		if !validReasonCode(r.ErrorCode) || r.Status != nil || r.BackupSize != 0 {
+		if !validReasonCode(r.ErrorCode) || responsePayloadCount(r) != 0 {
 			return ErrMalformedResponse
 		}
 	default:
@@ -155,10 +172,31 @@ func (r response) validate() error {
 	if r.Status != nil && !r.Status.valid() {
 		return ErrMalformedResponse
 	}
-	if r.BackupSize < 0 {
+	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) {
 		return ErrMalformedResponse
 	}
 	return nil
+}
+
+func responsePayloadCount(value response) int {
+	count := 0
+	if value.Status != nil {
+		count++
+	}
+	if value.BackupSize != 0 {
+		count++
+	}
+	if value.TargetResult != nil {
+		count++
+	}
+	return count
+}
+
+func validTargetResult(result target.RegistrationResult) bool {
+	if result.SchemaVersion != SchemaVersion || result.Version == 0 || result.TargetID == "" {
+		return false
+	}
+	return true
 }
 
 func (s Status) valid() bool {
@@ -179,7 +217,7 @@ func (s Status) valid() bool {
 }
 
 func validOperation(operation Operation) bool {
-	return operation == OperationStatus || operation == OperationBackup
+	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister
 }
 
 func validRequestID(value string) bool {

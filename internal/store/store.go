@@ -17,7 +17,7 @@ import (
 const (
 	// CurrentSchemaVersion is the newest local-state schema supported by this
 	// binary. Future schema changes must append a transactional migration.
-	CurrentSchemaVersion uint32 = 1
+	CurrentSchemaVersion uint32 = 2
 
 	dataFileMode os.FileMode = 0o600
 )
@@ -79,9 +79,11 @@ const (
 	BucketStabilizationResults Bucket = "stabilization_results"
 	// BucketDeliveryQueue holds durable, not-yet-finalized delivery items.
 	BucketDeliveryQueue Bucket = "delivery_queue"
+	// BucketServiceTargets holds registered, versioned monitoring targets.
+	BucketServiceTargets Bucket = "service_targets"
 )
 
-var dataBuckets = []Bucket{
+var initialDataBuckets = []Bucket{
 	BucketConfigurationVersions,
 	BucketIncidents,
 	BucketAnalysisReferences,
@@ -91,6 +93,8 @@ var dataBuckets = []Bucket{
 	BucketStabilizationResults,
 	BucketDeliveryQueue,
 }
+
+var dataBuckets = append(append([]Bucket(nil), initialDataBuckets...), BucketServiceTargets)
 
 var allowedBuckets = func() map[Bucket]struct{} {
 	buckets := make(map[Bucket]struct{}, len(dataBuckets))
@@ -151,7 +155,8 @@ type migration struct {
 }
 
 var defaultMigrations = []migration{
-	{from: 0, to: CurrentSchemaVersion, apply: applyInitialMigration},
+	{from: 0, to: 1, apply: applyInitialMigration},
+	{from: 1, to: CurrentSchemaVersion, apply: applyServiceTargetMigration},
 }
 
 // Open opens a daemon-owned local store, applies supported migrations, and
@@ -564,12 +569,17 @@ func applyInitialMigration(transaction *bbolt.Tx) error {
 	if _, err := transaction.CreateBucketIfNotExists(metadataBucket); err != nil {
 		return err
 	}
-	for _, bucket := range dataBuckets {
+	for _, bucket := range initialDataBuckets {
 		if _, err := transaction.CreateBucketIfNotExists([]byte(bucket)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func applyServiceTargetMigration(transaction *bbolt.Tx) error {
+	_, err := transaction.CreateBucketIfNotExists([]byte(BucketServiceTargets))
+	return err
 }
 
 func readSchemaVersion(transaction *bbolt.Tx) (uint32, error) {

@@ -14,6 +14,7 @@ import (
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/target"
 )
 
 const (
@@ -30,6 +31,8 @@ const (
 	errorAuthentication      = "authentication_failed"
 	errorPermissionDenied    = "permission_denied"
 	errorMalformedRequest    = "malformed_request"
+	errorTargetRejected      = "target_rejected"
+	auditReasonUnsupported   = "unsupported_operation"
 	statusCapabilityAdminIPC = "admin_ipc"
 	statusUnsupportedHost    = "host_power_os_network_outage"
 )
@@ -48,6 +51,9 @@ type Options struct {
 	AllowedGIDs []uint32
 	// State is the daemon-owned store used for audit records and backups.
 	State *store.Store
+	// Targets routes target registrations through one daemon-owned registry.
+	// It may be nil when a server exposes only the earlier status and backup API.
+	Targets *target.Registry
 	// RequestTimeout bounds each authenticated request and backup stream. Zero
 	// uses the safe default timeout.
 	RequestTimeout time.Duration
@@ -65,6 +71,7 @@ type Server struct {
 	allowedUIDs     map[uint32]struct{}
 	allowedGIDs     map[uint32]struct{}
 	state           *store.Store
+	targets         *target.Registry
 	requestTimeout  time.Duration
 	peerCredentials PeerCredentials
 
@@ -116,6 +123,7 @@ func NewServer(options Options) (*Server, error) {
 		allowedUIDs:     allowedUIDs,
 		allowedGIDs:     allowedGIDs,
 		state:           options.State,
+		targets:         options.Targets,
 		requestTimeout:  timeout,
 		peerCredentials: peerCredentials,
 		connections:     make(map[*net.UnixConn]struct{}),
@@ -337,6 +345,40 @@ func (s *Server) route(connection *net.UnixConn, actor Actor, request Request) {
 				BackupSize:    size,
 			})
 		})
+	case OperationTargetRegister:
+		if s.targets == nil || request.Target == nil {
+			if s.appendAudit(actor, request.RequestID, auditActionRequest, auditResultRejected, auditReasonUnsupported) == nil {
+				if err := writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected)); err != nil {
+					return
+				}
+			}
+			return
+		}
+		snapshot, err := s.targets.Register(target.Registration{
+			Target:        *request.Target,
+			ActorIdentity: actor.Identity(),
+			RequestID:     request.RequestID,
+			ReasonCode:    request.ReasonCode,
+		})
+		if err != nil {
+			if writeErr := writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected)); writeErr != nil {
+				return
+			}
+			return
+		}
+		result := target.RegistrationResult{
+			SchemaVersion: SchemaVersion,
+			Version:       snapshot.Version,
+			TargetID:      request.Target.TargetID,
+		}
+		if err := writeMessage(connection, response{
+			SchemaVersion: SchemaVersion,
+			RequestID:     request.RequestID,
+			Result:        resultSuccess,
+			TargetResult:  &result,
+		}); err != nil {
+			return
+		}
 	}
 }
 

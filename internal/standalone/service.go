@@ -12,6 +12,7 @@ import (
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/target"
 )
 
 const (
@@ -80,12 +81,31 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 			runErr = fmt.Errorf("close daemon-owned state: %w", closeErr)
 		}
 	}()
+	allowedTargets := make([]target.AllowedTarget, len(runtimeConfig.AllowedTargets))
+	for index, configured := range runtimeConfig.AllowedTargets {
+		allowedTargets[index] = target.AllowedTarget{
+			TargetID:    configured.TargetID,
+			AdapterType: configured.AdapterType,
+		}
+	}
+	registry, err := target.NewRegistry(target.Options{
+		State:            state,
+		AllowedTargets:   allowedTargets,
+		MaxTargets:       runtimeConfig.Limits.MaxTargets,
+		MaxEvidenceBytes: runtimeConfig.Limits.Retention.MaxBytes,
+		Clock:            time.Now,
+		NewAuditEventID:  target.NewAuditEventID,
+	})
+	if err != nil {
+		return fmt.Errorf("create target registry: %w", err)
+	}
 
 	server, err := adminipc.NewServer(adminipc.Options{
 		SocketPath:  runtimeConfig.Admin.SocketPath,
 		AllowedUIDs: runtimeConfig.Admin.AllowedUIDs,
 		AllowedGIDs: runtimeConfig.Admin.AllowedGIDs,
 		State:       state,
+		Targets:     registry,
 	})
 	if err != nil {
 		return fmt.Errorf("create administrative IPC server: %w", err)

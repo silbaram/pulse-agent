@@ -87,6 +87,12 @@ func TestConfig_ValidateRejectsMissingOrDuplicateAdminIdentities(t *testing.T) {
 				value.Admin.AllowedGIDs = []uint32{1000, 1000}
 			},
 		},
+		{
+			name: "target ID traversal",
+			mutate: func(value *Config) {
+				value.AllowedTargets[0].TargetID = "../escape"
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

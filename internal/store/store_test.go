@@ -44,6 +44,40 @@ func TestOpen_CreatesExplicitBucketsWithOwnerOnlyPermissions(t *testing.T) {
 	}
 }
 
+func TestOpen_MigratesVersionOneStoreWithTargetBucket(t *testing.T) {
+	options := testOptions(t, "state.db")
+	database, err := bbolt.Open(options.Path, dataFileMode, nil)
+	if err != nil {
+		t.Fatalf("open version one fixture: %v", err)
+	}
+	if err := database.Update(func(transaction *bbolt.Tx) error {
+		if err := applyInitialMigration(transaction); err != nil {
+			return err
+		}
+		return writeSchemaVersion(transaction, 1)
+	}); err != nil {
+		_ = database.Close()
+		t.Fatalf("write version one fixture: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close version one fixture: %v", err)
+	}
+
+	upgraded := openTestStore(t, options)
+	version, err := upgraded.SchemaVersion()
+	if err != nil || version != CurrentSchemaVersion {
+		t.Fatalf("upgraded SchemaVersion() = %d, error %v; want %d", version, err, CurrentSchemaVersion)
+	}
+	if err := upgraded.View(func(transaction *Tx) error {
+		if _, found, err := transaction.Get(BucketServiceTargets, "checkout"); err != nil || found {
+			t.Fatalf("migrated target bucket Get() = found %t, error %v; want empty bucket", found, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify migrated target bucket: %v", err)
+	}
+}
+
 func TestStore_TransactionsRollbackAndCopyValues(t *testing.T) {
 	store := openTestStore(t, testOptions(t, "state.db"))
 	defer store.Close()

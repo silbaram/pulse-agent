@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
+	"pulse-agent/internal/contract"
+	"pulse-agent/internal/target"
 )
 
 type runnerFunc func(context.Context) error
@@ -22,8 +25,9 @@ func (f runnerFunc) Run(ctx context.Context) error {
 }
 
 type fakeAdminClient struct {
-	status func(context.Context, string, string) (adminipc.Status, error)
-	backup func(context.Context, string, string, io.Writer) error
+	status   func(context.Context, string, string) (adminipc.Status, error)
+	backup   func(context.Context, string, string, io.Writer) error
+	register func(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
 }
 
 func (c fakeAdminClient) Status(ctx context.Context, socketPath, reasonCode string) (adminipc.Status, error) {
@@ -38,6 +42,13 @@ func (c fakeAdminClient) Backup(ctx context.Context, socketPath, reasonCode stri
 		return errors.New("unexpected backup request")
 	}
 	return c.backup(ctx, socketPath, reasonCode, destination)
+}
+
+func (c fakeAdminClient) Register(ctx context.Context, socketPath, reasonCode string, submitted contract.ServiceTarget) (target.RegistrationResult, error) {
+	if c.register == nil {
+		return target.RegistrationResult{}, errors.New("unexpected target registration")
+	}
+	return c.register(ctx, socketPath, reasonCode, submitted)
 }
 
 func TestExecute_HelpExposesApprovedCommands(t *testing.T) {
@@ -84,7 +95,6 @@ func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing
 		name string
 		args []string
 	}{
-		{name: "target register", args: []string{"target", "register"}},
 		{name: "runbook validate", args: []string{"runbook", "validate"}},
 		{name: "runbook register", args: []string{"runbook", "register"}},
 		{name: "incident list", args: []string{"incident", "list"}},
@@ -130,6 +140,78 @@ func TestExecute_RecognizedUnimplementedCommandsReturnStructuredError(t *testing
 				t.Error("error retryable = true, want false")
 			}
 		})
+	}
+}
+
+func TestExecute_TargetRegisterRoutesThroughDaemonClient(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	targetPath := filepath.Join(t.TempDir(), "target.json")
+	submitted := contract.ServiceTarget{
+		SchemaVersion: contract.SchemaVersionV1,
+		TargetID:      "checkout",
+		AdapterType:   "docker",
+		Selector:      "container:checkout",
+		ProbeRules: []contract.ProbeRule{{
+			RuleID:              "availability",
+			SignalType:          "availability",
+			Interval:            contract.NewDuration(time.Minute),
+			Timeout:             contract.NewDuration(time.Second),
+			Threshold:           1,
+			ConsecutiveFailures: 3,
+			RecoverySamples:     2,
+			SLOWindow:           contract.NewDuration(5 * time.Minute),
+			Severity:            contract.SeverityCritical,
+		}},
+		EvidencePolicy: contract.EvidencePolicy{RedactionProfile: "strict", MaxBytes: 1024},
+		StabilizationPolicy: contract.StabilizationPolicy{
+			RecoverySamples: 2,
+			Window:          contract.NewDuration(time.Minute),
+		},
+		Enabled: true,
+	}
+	document, err := json.Marshal(submitted)
+	if err != nil {
+		t.Fatalf("marshal target: %v", err)
+	}
+	if err := os.WriteFile(targetPath, document, 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	called := false
+	exitCode := executeWithDependencies(
+		context.Background(),
+		[]string{"target", "register", "--config", "test.json", "--target", targetPath, "--reason", "onboarding"},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { return nil }),
+		func(string) (config.Config, error) {
+			return config.Config{Admin: config.AdminConfig{SocketPath: "/var/lib/pulse-agent/admin.sock"}}, nil
+		},
+		fakeAdminClient{register: func(_ context.Context, socketPath, reasonCode string, got contract.ServiceTarget) (target.RegistrationResult, error) {
+			called = true
+			if socketPath != "/var/lib/pulse-agent/admin.sock" || reasonCode != "onboarding" {
+				t.Errorf("register route = socket %q, reason %q", socketPath, reasonCode)
+			}
+			if got.TargetID != submitted.TargetID {
+				t.Errorf("target ID = %q, want %q", got.TargetID, submitted.TargetID)
+			}
+			return target.RegistrationResult{SchemaVersion: target.SchemaVersion, Version: 1, TargetID: submitted.TargetID}, nil
+		}},
+	)
+
+	if exitCode != ExitSuccess {
+		t.Fatalf("executeWithDependencies() exit code = %d, want %d; stderr = %s", exitCode, ExitSuccess, stderr.String())
+	}
+	if !called {
+		t.Fatal("target register did not use daemon client")
+	}
+	var result target.RegistrationResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode target registration result %q: %v", stdout.String(), err)
+	}
+	if result.Version != 1 || result.TargetID != submitted.TargetID {
+		t.Errorf("target registration result = %#v, want registered target", result)
 	}
 }
 

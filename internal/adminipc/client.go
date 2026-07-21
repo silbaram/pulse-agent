@@ -10,6 +10,9 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"pulse-agent/internal/contract"
+	"pulse-agent/internal/target"
 )
 
 // Client sends a single authenticated request to a daemon-owned local socket.
@@ -25,7 +28,7 @@ func NewClient() *Client {
 
 // Status requests the safe bounded daemon status without opening local state.
 func (c *Client) Status(ctx context.Context, socketPath, reasonCode string) (Status, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -35,7 +38,7 @@ func (c *Client) Status(ctx context.Context, socketPath, reasonCode string) (Sta
 	if err != nil {
 		return Status{}, err
 	}
-	if response.Status == nil || response.BackupSize != 0 {
+	if response.Status == nil || response.BackupSize != 0 || response.TargetResult != nil {
 		return Status{}, ErrMalformedResponse
 	}
 	return *response.Status, nil
@@ -47,7 +50,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	if destination == nil {
 		return ErrInvalidOptions
 	}
-	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode)
+	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -57,7 +60,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	if err != nil {
 		return err
 	}
-	if response.Status != nil || response.BackupSize <= 0 {
+	if response.Status != nil || response.BackupSize <= 0 || response.TargetResult != nil {
 		return ErrMalformedResponse
 	}
 	written, err := io.CopyN(destination, reader, response.BackupSize)
@@ -73,7 +76,26 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	return nil
 }
 
-func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
+// Register submits a strict target document to the daemon. The client never
+// opens local state, performs a target-store transaction, or writes audit data.
+func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, submitted contract.ServiceTarget) (target.RegistrationResult, error) {
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted)
+	if stopClose != nil {
+		defer stopClose()
+	}
+	if connection != nil {
+		defer connection.Close()
+	}
+	if err != nil {
+		return target.RegistrationResult{}, err
+	}
+	if response.Status != nil || response.BackupSize != 0 || response.TargetResult == nil {
+		return target.RegistrationResult{}, ErrMalformedResponse
+	}
+	return *response.TargetResult, nil
+}
+
+func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
 	if ctx == nil || c == nil || c.requestTimeout <= 0 || !validOperation(operation) || !validReasonCode(reasonCode) {
 		return response{}, nil, nil, nil, ErrInvalidOptions
 	}
@@ -94,6 +116,7 @@ func (c *Client) request(ctx context.Context, socketPath string, operation Opera
 		RequestID:     requestID,
 		Operation:     operation,
 		ReasonCode:    reasonCode,
+		Target:        submitted,
 	}
 	if err := writeMessage(connection, request); err != nil {
 		stopClose()

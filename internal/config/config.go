@@ -35,6 +35,7 @@ var (
 )
 
 var secretReferencePattern = regexp.MustCompile(`^env:[A-Za-z_][A-Za-z0-9_]*$`)
+var targetIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`)
 
 // UsageMode identifies whether a configuration processes production or only
 // synthetic development data.
@@ -260,7 +261,7 @@ func validateAllowedTargets(targets []AllowedTarget, maxTargets int) error {
 	}
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
-		if target.TargetID == "" || target.AdapterType != "docker" {
+		if !validTargetID(target.TargetID) || target.AdapterType != "docker" {
 			return ErrInvalidConfig
 		}
 		if _, duplicate := seen[target.TargetID]; duplicate {
@@ -269,6 +270,10 @@ func validateAllowedTargets(targets []AllowedTarget, maxTargets int) error {
 		seen[target.TargetID] = struct{}{}
 	}
 	return nil
+}
+
+func validTargetID(value string) bool {
+	return targetIDPattern.MatchString(value) && !strings.Contains(value, "..")
 }
 
 func (c GeminiConfig) validate(usageMode UsageMode) error {

@@ -15,6 +15,7 @@ import (
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/target"
 )
 
 var authorizedTestActor = Actor{UID: 1000, GID: 1000}
@@ -124,6 +125,60 @@ func TestServer_RejectsMalformedRequestBeforeRouting(t *testing.T) {
 	}
 	assertAuditEvent(t, events[0], auditActionRequest, auditResultRejected, auditReasonMalformed)
 
+	stop()
+}
+
+func TestServer_TargetRegisterUsesDaemonRegistryAndAuditsActor(t *testing.T) {
+	state := openTestStore(t)
+	registry := newTestTargetRegistry(t, state)
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return authorizedTestActor, nil
+	}, registry)
+	client := &Client{requestTimeout: time.Second}
+
+	result, err := client.Register(context.Background(), socketPath, "onboarding", testServiceTarget())
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if result.Version != 1 || result.TargetID != "checkout" {
+		t.Fatalf("Register() result = %#v, want registered checkout target", result)
+	}
+	if persisted := registry.Snapshot(); persisted.Version != 1 || len(persisted.Targets) != 1 {
+		t.Fatalf("registry snapshot = %#v, want daemon-persisted target", persisted)
+	}
+
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	assertAuditEvent(t, events[0], "target.register", "accepted", "onboarding")
+	if events[0].ActorIdentity != authorizedTestActor.Identity() {
+		t.Errorf("audit actor identity = %q, want %q", events[0].ActorIdentity, authorizedTestActor.Identity())
+	}
+	stop()
+}
+
+func TestServer_TargetRegisterRejectsUnauthorizedPeer(t *testing.T) {
+	state := openTestStore(t)
+	registry := newTestTargetRegistry(t, state)
+	unauthorized := Actor{UID: authorizedTestActor.UID + 1, GID: authorizedTestActor.GID}
+	_, socketPath, stop := startTestServer(t, state, time.Second, func(*net.UnixConn) (Actor, error) {
+		return unauthorized, nil
+	}, registry)
+	client := &Client{requestTimeout: time.Second}
+
+	_, err := client.Register(context.Background(), socketPath, "onboarding", testServiceTarget())
+	if !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("Register() error = %v, want %v", err, ErrRequestRejected)
+	}
+	if snapshot := registry.Snapshot(); len(snapshot.Targets) != 0 {
+		t.Fatalf("unauthorized request changed target registry: %#v", snapshot)
+	}
+	events := readAuditEvents(t, state)
+	if len(events) != 1 {
+		t.Fatalf("audit event count = %d, want 1", len(events))
+	}
+	assertAuditEvent(t, events[0], auditActionRequest, auditResultRejected, auditReasonUnauthorized)
 	stop()
 }
 
@@ -308,10 +363,14 @@ func openTestStore(t *testing.T) *store.Store {
 	return state
 }
 
-func startTestServer(t *testing.T, state *store.Store, timeout time.Duration, credentials PeerCredentials) (*Server, string, func()) {
+func startTestServer(t *testing.T, state *store.Store, timeout time.Duration, credentials PeerCredentials, registries ...*target.Registry) (*Server, string, func()) {
 	t.Helper()
 	socketPath := testSocketPath(t)
-	server := newTestServer(t, state, socketPath, timeout, credentials)
+	var registry *target.Registry
+	if len(registries) == 1 {
+		registry = registries[0]
+	}
+	server := newTestServerWithTargets(t, state, socketPath, timeout, credentials, registry)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -352,12 +411,17 @@ func testSocketPath(t *testing.T) string {
 }
 
 func newTestServer(t *testing.T, state *store.Store, socketPath string, timeout time.Duration, credentials PeerCredentials) *Server {
+	return newTestServerWithTargets(t, state, socketPath, timeout, credentials, nil)
+}
+
+func newTestServerWithTargets(t *testing.T, state *store.Store, socketPath string, timeout time.Duration, credentials PeerCredentials, registry *target.Registry) *Server {
 	t.Helper()
 	server, err := NewServer(Options{
 		SocketPath:      socketPath,
 		AllowedUIDs:     []uint32{authorizedTestActor.UID},
 		AllowedGIDs:     []uint32{authorizedTestActor.GID},
 		State:           state,
+		Targets:         registry,
 		RequestTimeout:  timeout,
 		PeerCredentials: credentials,
 	})
@@ -365,6 +429,51 @@ func newTestServer(t *testing.T, state *store.Store, socketPath string, timeout 
 		t.Fatalf("NewServer() error = %v", err)
 	}
 	return server
+}
+
+func newTestTargetRegistry(t *testing.T, state *store.Store) *target.Registry {
+	t.Helper()
+	registry, err := target.NewRegistry(target.Options{
+		State: state,
+		AllowedTargets: []target.AllowedTarget{{
+			TargetID:    "checkout",
+			AdapterType: "docker",
+		}},
+		MaxTargets:       2,
+		MaxEvidenceBytes: 1024,
+		Clock:            time.Now,
+		NewAuditEventID:  target.NewAuditEventID,
+	})
+	if err != nil {
+		t.Fatalf("target.NewRegistry() error = %v", err)
+	}
+	return registry
+}
+
+func testServiceTarget() contract.ServiceTarget {
+	return contract.ServiceTarget{
+		SchemaVersion: contract.SchemaVersionV1,
+		TargetID:      "checkout",
+		AdapterType:   "docker",
+		Selector:      "container:checkout",
+		ProbeRules: []contract.ProbeRule{{
+			RuleID:              "availability",
+			SignalType:          "availability",
+			Interval:            contract.NewDuration(time.Minute),
+			Timeout:             contract.NewDuration(time.Second),
+			Threshold:           1,
+			ConsecutiveFailures: 3,
+			RecoverySamples:     2,
+			SLOWindow:           contract.NewDuration(5 * time.Minute),
+			Severity:            contract.SeverityCritical,
+		}},
+		EvidencePolicy: contract.EvidencePolicy{RedactionProfile: "strict", MaxBytes: 1024},
+		StabilizationPolicy: contract.StabilizationPolicy{
+			RecoverySamples: 2,
+			Window:          contract.NewDuration(time.Minute),
+		},
+		Enabled: true,
+	}
 }
 
 func waitForSocket(t *testing.T, server *Server, socketPath string, result <-chan error) {

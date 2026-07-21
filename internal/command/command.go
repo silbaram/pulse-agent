@@ -11,7 +11,9 @@ import (
 
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
+	"pulse-agent/internal/contract"
 	"pulse-agent/internal/standalone"
+	"pulse-agent/internal/target"
 )
 
 const (
@@ -51,6 +53,7 @@ type configuredStandaloneRunner interface {
 type adminClient interface {
 	Status(context.Context, string, string) (adminipc.Status, error)
 	Backup(context.Context, string, string, io.Writer) error
+	Register(context.Context, string, string, contract.ServiceTarget) (target.RegistrationResult, error)
 }
 
 type configLoader func(string) (config.Config, error)
@@ -128,12 +131,60 @@ func executeWithDependencies(
 	if _, ok := directCommands[args[0]]; ok {
 		return executeAdmin(ctx, args, stdout, stderr, loadConfig, client)
 	}
+	if args[0] == "target" {
+		return executeTarget(ctx, args, stdout, stderr, loadConfig, client)
+	}
 
 	if subcommands, ok := commandGroups[args[0]]; ok {
 		return executeGroup(args, stdout, stderr, subcommands)
 	}
 
 	return writeError(stderr, ExitUsage, "unknown_command", args[0], "unknown command")
+}
+
+func executeTarget(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+	loadConfig configLoader,
+	client adminClient,
+) int {
+	const commandName = "target register"
+	if len(args) == 2 && isHelp(args[1]) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent target register --config <path> --target <path> [--reason <code>]")
+		return ExitSuccess
+	}
+	if len(args) == 3 && args[1] == "register" && isHelp(args[2]) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent target register --config <path> --target <path> [--reason <code>]")
+		return ExitSuccess
+	}
+	if len(args) != 6 && len(args) != 8 {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "target register requires --config <path> --target <path> with optional --reason <code>")
+	}
+	if args[1] != "register" || args[2] != "--config" || args[3] == "" || args[4] != "--target" || args[5] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "target register requires --config <path> --target <path> with optional --reason <code>")
+	}
+	reasonCode := adminipc.DefaultReasonCode
+	if len(args) == 8 {
+		if args[6] != "--reason" || args[7] == "" {
+			return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "target register requires --config <path> --target <path> with optional --reason <code>")
+		}
+		reasonCode = args[7]
+	}
+	runtimeConfig, err := loadConfig(args[3])
+	if err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", commandName, "configuration validation failed")
+	}
+	submitted, err := target.Load(args[5])
+	if err != nil {
+		return writeError(stderr, ExitUsage, "target_invalid", commandName, "target document validation failed")
+	}
+	result, err := client.Register(ctx, runtimeConfig.Admin.SocketPath, reasonCode, submitted)
+	if err != nil {
+		return writeAdminRequestError(stderr, commandName, err)
+	}
+	return writeTargetRegistrationResult(stdout, result)
 }
 
 func executeStandalone(
@@ -258,6 +309,15 @@ func writeStatus(stdout io.Writer, status adminipc.Status) int {
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(status); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return ExitFailure
+	}
+	return ExitSuccess
+}
+
+func writeTargetRegistrationResult(stdout io.Writer, result target.RegistrationResult) int {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(result); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		return ExitFailure
 	}
 	return ExitSuccess
