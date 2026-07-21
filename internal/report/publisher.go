@@ -18,6 +18,7 @@ import (
 	"pulse-agent/internal/delivery"
 	"pulse-agent/internal/lifecycle"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -58,6 +59,8 @@ type Options struct {
 	Clock Clock
 	// DeliveryTTL bounds how long a terminal report may remain pending. Zero defaults to one day.
 	DeliveryTTL time.Duration
+	// Telemetry records bounded terminal publication outcomes after local durability succeeds.
+	Telemetry *telemetry.Recorder
 }
 
 // Publisher composes terminal reports and pairs each with a terminal lifecycle
@@ -70,6 +73,7 @@ type Publisher struct {
 	destinationRef string
 	clock          Clock
 	deliveryTTL    time.Duration
+	telemetry      *telemetry.Recorder
 
 	mu sync.Mutex
 }
@@ -116,13 +120,16 @@ func New(options Options) (*Publisher, error) {
 		destinationRef: options.DestinationRef,
 		clock:          options.Clock,
 		deliveryTTL:    ttl,
+		telemetry:      options.Telemetry,
 	}, nil
 }
 
 // PublishTerminal persists a report before publishing its paired terminal
 // lifecycle event. A retry with the same idempotency key completes any missing
 // paired event without creating another report delivery item.
-func (p *Publisher) PublishTerminal(ctx context.Context, input Input) (Result, error) {
+func (p *Publisher) PublishTerminal(ctx context.Context, input Input) (result Result, err error) {
+	startedAt := time.Now()
+	defer func() { p.recordPublication(ctx, startedAt, result, err) }()
 	if p == nil || ctx == nil {
 		return Result{}, ErrInvalidInput
 	}
@@ -145,7 +152,7 @@ func (p *Publisher) PublishTerminal(ctx context.Context, input Input) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{Report: report, Duplicate: found}
+	result = Result{Report: report, Duplicate: found}
 	if found {
 		if !sameReport(existing, report) {
 			return Result{}, ErrInvalidInput
@@ -189,6 +196,31 @@ func (p *Publisher) PublishTerminal(ctx context.Context, input Input) (Result, e
 	result.LifecycleQueueItem = lifecycleResult.QueueItem
 	result.Duplicate = result.Duplicate && lifecycleResult.Duplicate
 	return result, nil
+}
+
+func (p *Publisher) recordPublication(ctx context.Context, startedAt time.Time, result Result, publicationErr error) {
+	if p == nil || p.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if publicationErr != nil {
+		switch {
+		case errors.Is(publicationErr, ErrInvalidInput):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(publicationErr, context.DeadlineExceeded):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(publicationErr, context.Canceled):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		default:
+			telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	} else if result.Duplicate {
+		reason = telemetry.ReasonDuplicate
+	}
+	event, eventErr := telemetry.NewEvent(telemetry.ComponentReport, telemetry.OperationPublish, telemetryResult, reason, time.Since(startedAt))
+	if eventErr == nil {
+		p.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 // StableReportID derives an opaque stable report identity without retaining an

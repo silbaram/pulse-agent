@@ -14,6 +14,7 @@ import (
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -69,6 +70,8 @@ type ApprovalOptions struct {
 	NewApprovalID func() (string, error)
 	// NewAuditEventID creates a unique event ID for every decision result.
 	NewAuditEventID func() (string, error)
+	// Telemetry records only the bounded approval decision outcome.
+	Telemetry *telemetry.Recorder
 }
 
 // ApprovalManager records exactly one immutable local decision for a pending
@@ -78,6 +81,7 @@ type ApprovalManager struct {
 	clock           Clock
 	newApprovalID   func() (string, error)
 	newAuditEventID func() (string, error)
+	telemetry       *telemetry.Recorder
 }
 
 // ApprovalDecisionRequest is the daemon-owned context for one local grant or
@@ -119,12 +123,15 @@ func NewApprovalManager(options ApprovalOptions) (*ApprovalManager, error) {
 		clock:           options.Clock,
 		newApprovalID:   options.NewApprovalID,
 		newAuditEventID: options.NewAuditEventID,
+		telemetry:       options.Telemetry,
 	}, nil
 }
 
 // Decide records one local grant or denial and its audit event in one store
 // transaction. A replay or conflicting decision never changes the command.
-func (m *ApprovalManager) Decide(request ApprovalDecisionRequest) (ApprovalDecisionResult, error) {
+func (m *ApprovalManager) Decide(request ApprovalDecisionRequest) (result ApprovalDecisionResult, err error) {
+	startedAt := time.Now()
+	defer func() { m.recordDecision(startedAt, result, err) }()
 	if m == nil || !validApprovalDecisionRequest(request) {
 		if m != nil {
 			if err := m.recordRejected(request, approvalAuditInvalid); err != nil {
@@ -143,8 +150,8 @@ func (m *ApprovalManager) Decide(request ApprovalDecisionRequest) (ApprovalDecis
 	}
 
 	var (
-		result      ApprovalDecisionResult
-		decisionErr error
+		decisionResult ApprovalDecisionResult
+		decisionErr    error
 	)
 	err = m.state.Update(func(transaction *store.Tx) error {
 		stored, found, err := findRecordByCommandID(transaction, request.CommandID)
@@ -218,7 +225,7 @@ func (m *ApprovalManager) Decide(request ApprovalDecisionRequest) (ApprovalDecis
 			if err := putRecord(transaction, stored.key, record); err != nil {
 				return err
 			}
-			result = ApprovalDecisionResult{Approval: approval, Command: record.Command}
+			decisionResult = ApprovalDecisionResult{Approval: approval, Command: record.Command}
 			return nil
 		})
 	})
@@ -228,7 +235,34 @@ func (m *ApprovalManager) Decide(request ApprovalDecisionRequest) (ApprovalDecis
 	if decisionErr != nil {
 		return ApprovalDecisionResult{}, decisionErr
 	}
-	return result, nil
+	return decisionResult, nil
+}
+
+func (m *ApprovalManager) recordDecision(startedAt time.Time, result ApprovalDecisionResult, decisionErr error) {
+	if m == nil || m.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if decisionErr != nil {
+		switch {
+		case errors.Is(decisionErr, ErrInvalidApprovalDecision):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(decisionErr, ErrApprovalConflict):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonConflict
+		case errors.Is(decisionErr, ErrApprovalCommandExpired):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonExpired
+		case errors.Is(decisionErr, ErrApprovalCommandNotFound):
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		default:
+			telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	} else if result.Approval.Decision == contract.ApprovalDenied {
+		telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonDenied
+	}
+	event, eventErr := telemetry.NewEvent(telemetry.ComponentApproval, telemetry.OperationDecide, telemetryResult, reason, time.Since(startedAt))
+	if eventErr == nil {
+		m.telemetry.RecordBestEffort(context.Background(), event)
+	}
 }
 
 // LoadApproval returns the immutable decision associated with commandID. It

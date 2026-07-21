@@ -18,6 +18,7 @@ import (
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 	"pulse-agent/internal/webhook"
 )
 
@@ -110,6 +111,8 @@ type Options struct {
 	RequestTimeout time.Duration
 	// MaxPayloadBytes bounds exact JSON bytes loaded for one delivery.
 	MaxPayloadBytes int
+	// Telemetry records bounded queue and delivery outcomes without payloads or endpoints.
+	Telemetry *telemetry.Recorder
 }
 
 // Dispatcher owns durable queue mutation and outbound delivery. Its methods are
@@ -131,6 +134,7 @@ type Dispatcher struct {
 	maxBackoff      time.Duration
 	requestTimeout  time.Duration
 	maxPayloadBytes int
+	telemetry       *telemetry.Recorder
 
 	mu sync.Mutex
 }
@@ -193,6 +197,7 @@ func New(options Options) (*Dispatcher, error) {
 		maxBackoff:      options.MaxBackoff,
 		requestTimeout:  options.RequestTimeout,
 		maxPayloadBytes: options.MaxPayloadBytes,
+		telemetry:       options.Telemetry,
 	}, nil
 }
 
@@ -220,7 +225,9 @@ func (d *Dispatcher) EnqueueWithMutation(request EnqueueRequest, mutation Mutati
 	return d.enqueue(request, mutation)
 }
 
-func (d *Dispatcher) enqueue(request EnqueueRequest, mutation Mutation) (contract.DeliveryQueueItem, error) {
+func (d *Dispatcher) enqueue(request EnqueueRequest, mutation Mutation) (item contract.DeliveryQueueItem, err error) {
+	startedAt := time.Now()
+	defer func() { d.recordEnqueue(startedAt, err) }()
 	if d == nil || validateEnqueueRequest(request, d.destinations) != nil {
 		return contract.DeliveryQueueItem{}, ErrInvalidRequest
 	}
@@ -242,7 +249,7 @@ func (d *Dispatcher) enqueue(request EnqueueRequest, mutation Mutation) (contrac
 	if _, err := d.keyring.Sign(webhookID, now, nil); err != nil {
 		return contract.DeliveryQueueItem{}, ErrInvalidRequest
 	}
-	item := contract.DeliveryQueueItem{
+	item = contract.DeliveryQueueItem{
 		SchemaVersion:  contract.SchemaVersionV1,
 		DeliveryID:     deliveryID,
 		PayloadType:    request.PayloadType,
@@ -329,7 +336,9 @@ func (d *Dispatcher) DeliverDue(ctx context.Context) ([]Result, error) {
 	return results, nil
 }
 
-func (d *Dispatcher) deliverOne(ctx context.Context, stored storedItem, now time.Time) (Result, error) {
+func (d *Dispatcher) deliverOne(ctx context.Context, stored storedItem, now time.Time) (result Result, err error) {
+	startedAt := time.Now()
+	defer func() { d.recordDelivery(ctx, startedAt, result, err) }()
 	requestCtx, cancel := context.WithTimeout(ctx, d.requestTimeout)
 	defer cancel()
 	body, err := d.payloads.Load(requestCtx, stored.item.PayloadType, stored.item.PayloadRef)
@@ -361,6 +370,64 @@ func (d *Dispatcher) deliverOne(ctx context.Context, stored storedItem, now time
 		return d.retryOrFail(stored, now, "endpoint_failed")
 	}
 	return d.markDelivered(stored, now)
+}
+
+func (d *Dispatcher) recordEnqueue(startedAt time.Time, enqueueErr error) {
+	if d == nil || d.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if enqueueErr != nil {
+		switch {
+		case errors.Is(enqueueErr, ErrInvalidRequest):
+			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		case errors.Is(enqueueErr, ErrQueueFull):
+			result, reason = telemetry.ResultRejected, telemetry.ReasonUnavailable
+		case errors.Is(enqueueErr, ErrDeliveryConflict):
+			result, reason = telemetry.ResultRejected, telemetry.ReasonConflict
+		default:
+			result, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	}
+	event, eventErr := telemetry.NewEvent(telemetry.ComponentDelivery, telemetry.OperationWrite, result, reason, time.Since(startedAt))
+	if eventErr == nil {
+		d.telemetry.RecordBestEffort(context.Background(), event)
+	}
+}
+
+func (d *Dispatcher) recordDelivery(ctx context.Context, startedAt time.Time, result Result, deliveryErr error) {
+	if d == nil || d.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if deliveryErr != nil {
+		switch {
+		case errors.Is(deliveryErr, context.DeadlineExceeded):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(deliveryErr, context.Canceled):
+			telemetryResult, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		default:
+			telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		}
+	} else if result.Retrying {
+		reason = telemetry.ReasonRetry
+	} else if !result.Sent {
+		telemetryResult = telemetry.ResultRejected
+		switch result.ReasonCode {
+		case "expired":
+			reason = telemetry.ReasonExpired
+		case "payload_unavailable":
+			reason = telemetry.ReasonPayload
+		case "endpoint_failed", "attempts_exhausted":
+			reason = telemetry.ReasonUnavailable
+		default:
+			reason = telemetry.ReasonInternal
+		}
+	}
+	event, eventErr := telemetry.NewEvent(telemetry.ComponentDelivery, telemetry.OperationDeliver, telemetryResult, reason, time.Since(startedAt))
+	if eventErr == nil {
+		d.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 func closeResponse(response *http.Response) error {

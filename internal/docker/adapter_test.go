@@ -10,6 +10,10 @@ import (
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/evidence"
+	"pulse-agent/internal/telemetry"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestAdapterLifecycleUsesBoundedSDKCalls(t *testing.T) {
@@ -141,6 +145,61 @@ func TestAdapterMapsDaemonAndTimeoutErrors(t *testing.T) {
 	})
 }
 
+func TestAdapter_EmitsBoundedActionTelemetryAndIsolatesExporterFailure(t *testing.T) {
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("telemetry shutdown error = %v", shutdownErr)
+		}
+	})
+
+	fake := &fakeClient{containers: map[string]Container{"web": {ID: "container-web", Running: true, Health: "healthy"}}}
+	adapter := newAdapter(t, fake)
+	adapter.telemetry = recorder
+	target := containerTarget()
+	target.TargetID = "target-raw-secret"
+	action := contract.TypedAction{ActionType: contract.ActionDockerContainerRestart, TargetSelector: target.Selector, StopTimeout: contract.NewDuration(time.Second)}
+	if err := adapter.Execute(context.Background(), target, action); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("telemetry flush error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.docker.execute" {
+		t.Fatalf("telemetry spans = %#v, want one bounded Docker execute span", spans)
+	}
+	attributes := make(map[string]string, len(spans[0].Attributes))
+	for _, value := range spans[0].Attributes {
+		attributes[string(value.Key)] = value.Value.AsString()
+	}
+	if attributes[telemetry.AttributeTarget] != string(telemetry.TargetDocker) || attributes[telemetry.AttributeResult] != string(telemetry.ResultSuccess) || attributes[telemetry.AttributeReason] != string(telemetry.ReasonAccepted) {
+		t.Fatalf("telemetry attributes = %#v, want bounded Docker success contract", attributes)
+	}
+	for _, value := range attributes {
+		if strings.Contains(value, "raw-secret") || strings.Contains(value, "container-web") {
+			t.Fatalf("telemetry leaked target identity: %#v", attributes)
+		}
+	}
+
+	failing, err := telemetry.New(telemetry.Options{SpanExporter: failingSpanExporter{err: errors.New("collector disconnected")}})
+	if err != nil {
+		t.Fatalf("telemetry.New(failing exporter) error = %v", err)
+	}
+	t.Cleanup(func() { _ = failing.Shutdown(context.Background()) })
+	adapter.telemetry = failing
+	if err := adapter.Execute(context.Background(), target, action); err != nil {
+		t.Fatalf("Execute() with failing telemetry exporter error = %v, want unchanged action outcome", err)
+	}
+	if err := failing.ForceFlush(context.Background()); err == nil {
+		t.Fatal("ForceFlush() error = nil, want disconnected exporter error")
+	}
+}
+
 type fakeClient struct {
 	containers   map[string]Container
 	listed       []Container
@@ -150,6 +209,14 @@ type fakeClient struct {
 	restartCalls int
 	sawDeadline  bool
 }
+
+type failingSpanExporter struct{ err error }
+
+func (e failingSpanExporter) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error {
+	return e.err
+}
+
+func (failingSpanExporter) Shutdown(context.Context) error { return nil }
 
 func (c *fakeClient) NegotiateAPIVersion(ctx context.Context) error {
 	c.negotiations++
