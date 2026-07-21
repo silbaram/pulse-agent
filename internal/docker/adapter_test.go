@@ -45,6 +45,27 @@ func TestAdapterLifecycleUsesBoundedSDKCalls(t *testing.T) {
 	}
 }
 
+func TestAdapter_UnhealthyRunningTargetCanTriggerAndReceiveRestart(t *testing.T) {
+	fake := &fakeClient{containers: map[string]Container{"web": {ID: "container-web", Running: true, Health: "unhealthy"}}}
+	adapter := newAdapter(t, fake)
+	target := containerTarget()
+	action := contract.TypedAction{ActionType: contract.ActionDockerContainerRestart, TargetSelector: target.Selector, StopTimeout: contract.NewDuration(time.Second)}
+
+	values, err := adapter.Observe(context.Background(), target, availabilityRule())
+	if err != nil || values["availability"] != 0 {
+		t.Fatalf("Observe() = %v, %v, want unavailable unhealthy target", values, err)
+	}
+	if err := adapter.ValidateAction(context.Background(), target, action); err != nil {
+		t.Fatalf("ValidateAction() error = %v, want running unhealthy target to be eligible", err)
+	}
+	if err := adapter.Execute(context.Background(), target, action); err != nil {
+		t.Fatalf("Execute() error = %v, want restart", err)
+	}
+	if fake.restartCalls != 1 {
+		t.Fatalf("Restart() calls = %d, want 1", fake.restartCalls)
+	}
+}
+
 func TestAdapterComposeRestartRequiresExactlyOneLabeledReplica(t *testing.T) {
 	target := composeTarget()
 	action := contract.TypedAction{ActionType: contract.ActionDockerComposeServiceRestart, TargetSelector: target.Selector}
@@ -56,7 +77,9 @@ func TestAdapterComposeRestartRequiresExactlyOneLabeledReplica(t *testing.T) {
 		{name: "zero replicas", want: ErrAmbiguousTarget},
 		{name: "two replicas", containers: []Container{{ID: "one", Running: true, Labels: map[string]string{composeServiceLabel: "web"}}, {ID: "two", Running: true, Labels: map[string]string{composeServiceLabel: "web"}}}, want: ErrAmbiguousTarget},
 		{name: "missing label", containers: []Container{{ID: "one", Running: true, Labels: map[string]string{}}}, want: ErrAmbiguousTarget},
-		{name: "one replica", containers: []Container{{ID: "one", Running: true, Labels: map[string]string{composeServiceLabel: "web"}}}},
+		{name: "one healthy replica", containers: []Container{{ID: "one", Running: true, Health: "healthy", Labels: map[string]string{composeServiceLabel: "web"}}}},
+		{name: "one unhealthy replica", containers: []Container{{ID: "one", Running: true, Health: "unhealthy", Labels: map[string]string{composeServiceLabel: "web"}}}},
+		{name: "stopped replica", containers: []Container{{ID: "one", Running: false, Labels: map[string]string{composeServiceLabel: "web"}}}, want: ErrPrecondition},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := &fakeClient{listed: test.containers}
