@@ -111,35 +111,22 @@ func (c *Coordinator) persistPending(record journalRecord) (journalRecord, bool,
 
 func (c *Coordinator) deny(key string) (journalRecord, error) {
 	return c.updateRecord(key, func(record *journalRecord) error {
-		if record.Phase != phasePending || record.Command.State != contract.RecoveryPending {
-			return errCommandNotExecutable
-		}
-		if err := record.Command.State.ValidateTransition(contract.RecoveryDenied); err != nil {
-			return err
-		}
-		record.Command.State = contract.RecoveryDenied
-		record.Phase = phaseCompleted
-		return nil
+		return transitionToDenied(record)
 	})
 }
 
 func (c *Coordinator) expire(key string) (journalRecord, error) {
 	return c.updateRecord(key, func(record *journalRecord) error {
-		if record.Phase != phasePending || record.Command.State != contract.RecoveryPending {
-			return errCommandNotExecutable
-		}
-		if err := record.Command.State.ValidateTransition(contract.RecoveryExpired); err != nil {
-			return err
-		}
-		record.Command.State = contract.RecoveryExpired
-		record.Phase = phaseCompleted
-		return nil
+		return transitionToExpired(record)
 	})
 }
 
 func (c *Coordinator) approve(key string) (journalRecord, error) {
 	return c.updateRecord(key, func(record *journalRecord) error {
-		if record.Phase != phasePending || record.Command.State != contract.RecoveryPending {
+		if (record.Phase != phasePending && record.Phase != phaseAwaitingApproval) || record.Command.State != contract.RecoveryPending {
+			return errCommandNotExecutable
+		}
+		if record.Phase == phaseAwaitingApproval && record.Command.ApprovalID == "" {
 			return errCommandNotExecutable
 		}
 		if err := record.Command.State.ValidateTransition(contract.RecoveryApproved); err != nil {

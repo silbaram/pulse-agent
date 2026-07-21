@@ -61,6 +61,7 @@ type adminClient interface {
 	RegisterRunbook(context.Context, string, string, contract.Runbook) (runbook.RegistrationResult, error)
 	ListIncidents(context.Context, string, string, incident.Filter) (incident.Page, error)
 	ShowIncident(context.Context, string, string, string) (contract.Incident, error)
+	DecideApproval(context.Context, string, string, string, contract.ApprovalDecision, time.Time) (adminipc.ApprovalResult, error)
 }
 
 type configLoader func(string) (config.Config, error)
@@ -162,12 +163,53 @@ func executeWithDependencies(
 	if args[0] == "incident" {
 		return executeIncident(ctx, args, stdout, stderr, loadConfig, client)
 	}
+	if args[0] == "approval" {
+		return executeApproval(ctx, args, stdout, stderr, loadConfig, client)
+	}
 
 	if subcommands, ok := commandGroups[args[0]]; ok {
 		return executeGroup(args, stdout, stderr, subcommands)
 	}
 
 	return writeError(stderr, ExitUsage, "unknown_command", args[0], "unknown command")
+}
+
+func executeApproval(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {
+	const commandName = "approval"
+	if len(args) >= 2 && isHelp(args[len(args)-1]) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent approval grant --config <path> --command-id <id> --expires-at <RFC3339> [--reason <code>]\n       pulse-agent approval deny --config <path> --command-id <id> --expires-at <RFC3339> [--reason <code>]")
+		return ExitSuccess
+	}
+	if len(args) != 8 && len(args) != 10 {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "approval requires grant or deny with --config, --command-id, and --expires-at")
+	}
+	if (args[1] != "grant" && args[1] != "deny") || args[2] != "--config" || args[3] == "" || args[4] != "--command-id" || args[5] == "" || args[6] != "--expires-at" || args[7] == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "approval requires grant or deny with --config, --command-id, and --expires-at")
+	}
+	reasonCode := adminipc.DefaultReasonCode
+	if len(args) == 10 {
+		if args[8] != "--reason" || args[9] == "" {
+			return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "invalid approval reason")
+		}
+		reasonCode = args[9]
+	}
+	expiresAt, err := time.Parse(time.RFC3339, args[7])
+	if err != nil {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "invalid approval expiry")
+	}
+	runtimeConfig, err := loadConfig(args[3])
+	if err != nil {
+		return writeError(stderr, ExitFailure, "config_invalid", commandName, "configuration validation failed")
+	}
+	decision := contract.ApprovalGranted
+	if args[1] == "deny" {
+		decision = contract.ApprovalDenied
+	}
+	result, err := client.DecideApproval(ctx, runtimeConfig.Admin.SocketPath, reasonCode, args[5], decision, expiresAt)
+	if err != nil {
+		return writeAdminRequestError(stderr, "approval "+args[1], err)
+	}
+	return writeJSON(stdout, result)
 }
 
 func executeIncident(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {

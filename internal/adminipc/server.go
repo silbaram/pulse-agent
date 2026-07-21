@@ -13,6 +13,7 @@ import (
 	"pulse-agent/internal/audit"
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/incident"
+	"pulse-agent/internal/recovery"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
@@ -31,6 +32,7 @@ const (
 	errorPermissionDenied    = "permission_denied"
 	errorMalformedRequest    = "malformed_request"
 	errorTargetRejected      = "target_rejected"
+	errorApprovalRejected    = "approval_rejected"
 	errorIncidentNotFound    = "incident_not_found"
 	auditReasonUnsupported   = "unsupported_operation"
 	statusCapabilityAdminIPC = "admin_ipc"
@@ -56,6 +58,8 @@ type Options struct {
 	Targets *target.Registry
 	// Runbooks routes typed runbook registrations through the daemon-owned registry.
 	Runbooks *runbook.Registry
+	// Approvals records local grant and denial decisions for waiting commands.
+	Approvals *recovery.ApprovalManager
 	// RequestTimeout bounds each authenticated request and backup stream. Zero
 	// uses the safe default timeout.
 	RequestTimeout time.Duration
@@ -80,6 +84,7 @@ type Server struct {
 	state           *store.Store
 	targets         *target.Registry
 	runbooks        *runbook.Registry
+	approvals       *recovery.ApprovalManager
 	incidents       *incident.Query
 	requestTimeout  time.Duration
 	peerCredentials PeerCredentials
@@ -141,6 +146,7 @@ func NewServer(options Options) (*Server, error) {
 		state:           options.State,
 		targets:         options.Targets,
 		runbooks:        options.Runbooks,
+		approvals:       options.Approvals,
 		incidents:       incidents,
 		requestTimeout:  timeout,
 		peerCredentials: peerCredentials,
@@ -389,7 +395,7 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 			Status: &Status{
 				SchemaVersion: SchemaVersion,
 				State:         StatusRunning,
-				Capabilities:  []string{statusCapabilityAdminIPC},
+				Capabilities:  s.capabilities(),
 				Unsupported:   []string{statusUnsupportedHost},
 			},
 		})
@@ -449,6 +455,33 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 			return writeMessage(connection, failureResponse(request.RequestID, errorTargetRejected))
 		}
 		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, RunbookResult: &result})
+	case OperationApprovalGrant, OperationApprovalDeny:
+		if s.approvals == nil || request.Approval == nil {
+			if err := s.appendAudit(actor, request.RequestID, auditActionRequest, auditResultRejected, auditReasonUnsupported); err != nil {
+				return err
+			}
+			return writeMessage(connection, failureResponse(request.RequestID, errorApprovalRejected))
+		}
+		decision, err := s.approvals.Decide(recovery.ApprovalDecisionRequest{
+			CommandID:     request.Approval.CommandID,
+			Decision:      request.Approval.Decision,
+			ActorIdentity: actor.Identity(),
+			RequestID:     request.RequestID,
+			ReasonCode:    request.ReasonCode,
+			ExpiresAt:     request.Approval.ExpiresAt,
+		})
+		if err != nil {
+			return writeMessage(connection, failureResponse(request.RequestID, errorApprovalRejected))
+		}
+		result := ApprovalResult{
+			SchemaVersion: SchemaVersion,
+			ApprovalID:    decision.Approval.ApprovalID,
+			CommandID:     decision.Approval.CommandID,
+			Decision:      decision.Approval.Decision,
+			CommandState:  decision.Command.State,
+			ExpiresAt:     decision.Approval.ExpiresAt,
+		}
+		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, ApprovalResult: &result})
 	case OperationIncidentList:
 		page, err := s.incidents.List(*request.IncidentFilter)
 		if err != nil {
@@ -472,6 +505,14 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 		return writeMessage(connection, response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Result: resultSuccess, Incident: &value})
 	}
 	return ErrMalformedRequest
+}
+
+func (s *Server) capabilities() []string {
+	capabilities := []string{statusCapabilityAdminIPC}
+	if s.approvals != nil {
+		capabilities = append(capabilities, "approval")
+	}
+	return capabilities
 }
 
 func (s *Server) authorized(actor Actor) bool {

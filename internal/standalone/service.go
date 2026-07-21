@@ -11,6 +11,7 @@ import (
 
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
+	"pulse-agent/internal/recovery"
 	"pulse-agent/internal/runbook"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
@@ -108,6 +109,15 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 	if err != nil {
 		return fmt.Errorf("create runbook registry: %w", err)
 	}
+	approvals, err := recovery.NewApprovalManager(recovery.ApprovalOptions{
+		State:           state,
+		Clock:           recovery.ClockFunc(time.Now),
+		NewApprovalID:   recovery.NewApprovalID,
+		NewAuditEventID: adminipc.NewAuditID,
+	})
+	if err != nil {
+		return fmt.Errorf("create approval manager: %w", err)
+	}
 
 	server, err := adminipc.NewServer(adminipc.Options{
 		SocketPath:  runtimeConfig.Admin.SocketPath,
@@ -116,6 +126,7 @@ func (s *Service) RunWithConfig(ctx context.Context, runtimeConfig config.Config
 		State:       state,
 		Targets:     registry,
 		Runbooks:    runbooks,
+		Approvals:   approvals,
 		Clock:       adminipc.SystemClock,
 		NewAuditID:  adminipc.NewAuditID,
 	})

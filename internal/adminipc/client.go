@@ -93,7 +93,7 @@ func NewProductionClient() (*Client, error) {
 
 // Status requests the safe bounded daemon status without opening local state.
 func (c *Client) Status(ctx context.Context, socketPath, reasonCode string) (Status, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil, nil, nil, "")
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationStatus, reasonCode, nil, nil, nil, "", nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -115,7 +115,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 	if destination == nil {
 		return ErrInvalidOptions
 	}
-	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil, nil, nil, "")
+	response, reader, connection, stopClose, err := c.request(ctx, socketPath, OperationBackup, reasonCode, nil, nil, nil, "", nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -144,7 +144,7 @@ func (c *Client) Backup(ctx context.Context, socketPath, reasonCode string, dest
 // Register submits a strict target document to the daemon. The client never
 // opens local state, performs a target-store transaction, or writes audit data.
 func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, submitted contract.ServiceTarget) (target.RegistrationResult, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted, nil, nil, "")
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationTargetRegister, reasonCode, &submitted, nil, nil, "", nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -163,7 +163,7 @@ func (c *Client) Register(ctx context.Context, socketPath, reasonCode string, su
 // RegisterRunbook submits a previously validated typed runbook through the
 // daemon-owned local IPC boundary.
 func (c *Client) RegisterRunbook(ctx context.Context, socketPath, reasonCode string, submitted contract.Runbook) (runbook.RegistrationResult, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationRunbookRegister, reasonCode, nil, &submitted, nil, "")
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationRunbookRegister, reasonCode, nil, &submitted, nil, "", nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -180,7 +180,7 @@ func (c *Client) RegisterRunbook(ctx context.Context, socketPath, reasonCode str
 }
 
 func (c *Client) ListIncidents(ctx context.Context, socketPath, reasonCode string, filter incident.Filter) (incident.Page, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentList, reasonCode, nil, nil, &filter, "")
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentList, reasonCode, nil, nil, &filter, "", nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -197,7 +197,7 @@ func (c *Client) ListIncidents(ctx context.Context, socketPath, reasonCode strin
 }
 
 func (c *Client) ShowIncident(ctx context.Context, socketPath, reasonCode, id string) (contract.Incident, error) {
-	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentShow, reasonCode, nil, nil, nil, id)
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, OperationIncidentShow, reasonCode, nil, nil, nil, id, nil)
 	if stopClose != nil {
 		defer stopClose()
 	}
@@ -216,7 +216,38 @@ func (c *Client) ShowIncident(ctx context.Context, socketPath, reasonCode, id st
 	return *response.Incident, nil
 }
 
-func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget, submittedRunbook *contract.Runbook, filter *incident.Filter, incidentID string) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
+// DecideApproval submits one bounded grant or denial through the authenticated
+// local daemon. It never opens the daemon state file or creates a remote
+// approval channel.
+func (c *Client) DecideApproval(ctx context.Context, socketPath, reasonCode, commandID string, decision contract.ApprovalDecision, expiresAt time.Time) (ApprovalResult, error) {
+	operation := OperationApprovalGrant
+	if decision == contract.ApprovalDenied {
+		operation = OperationApprovalDeny
+	}
+	if (decision != contract.ApprovalGranted && decision != contract.ApprovalDenied) || !validCode(commandID, maxRequestIDBytes) || expiresAt.IsZero() {
+		return ApprovalResult{}, ErrInvalidOptions
+	}
+	response, _, connection, stopClose, err := c.request(ctx, socketPath, operation, reasonCode, nil, nil, nil, "", &ApprovalRequest{
+		CommandID: commandID,
+		Decision:  decision,
+		ExpiresAt: expiresAt,
+	})
+	if stopClose != nil {
+		defer stopClose()
+	}
+	if connection != nil {
+		defer connection.Close()
+	}
+	if err != nil {
+		return ApprovalResult{}, err
+	}
+	if response.Status != nil || response.BackupSize != 0 || response.TargetResult != nil || response.RunbookResult != nil || response.IncidentPage != nil || response.Incident != nil || response.ApprovalResult == nil {
+		return ApprovalResult{}, ErrMalformedResponse
+	}
+	return *response.ApprovalResult, nil
+}
+
+func (c *Client) request(ctx context.Context, socketPath string, operation Operation, reasonCode string, submitted *contract.ServiceTarget, submittedRunbook *contract.Runbook, filter *incident.Filter, incidentID string, approval *ApprovalRequest) (response, *bufio.Reader, *net.UnixConn, func() bool, error) {
 	if ctx == nil || c == nil || c.requestTimeout <= 0 || c.clock == nil || c.newRequestID == nil || !validOperation(operation) || !validReasonCode(reasonCode) {
 		return response{}, nil, nil, nil, ErrInvalidOptions
 	}
@@ -239,6 +270,7 @@ func (c *Client) request(ctx context.Context, socketPath string, operation Opera
 		ReasonCode:     reasonCode,
 		Target:         submitted,
 		Runbook:        submittedRunbook,
+		Approval:       approval,
 		IncidentFilter: filter,
 		IncidentID:     incidentID,
 	}

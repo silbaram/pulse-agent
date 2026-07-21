@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/incident"
@@ -75,8 +76,12 @@ const (
 	OperationTargetRegister Operation = "target.register"
 	// OperationRunbookRegister submits one validated typed runbook to the daemon.
 	OperationRunbookRegister Operation = "runbook.register"
-	OperationIncidentList    Operation = "incident.list"
-	OperationIncidentShow    Operation = "incident.show"
+	// OperationApprovalGrant records one local grant for a waiting recovery command.
+	OperationApprovalGrant Operation = "approval.grant"
+	// OperationApprovalDeny records one local denial for a waiting recovery command.
+	OperationApprovalDeny Operation = "approval.deny"
+	OperationIncidentList Operation = "incident.list"
+	OperationIncidentShow Operation = "incident.show"
 )
 
 // StatusState identifies the lifecycle state returned by an administrative
@@ -100,6 +105,33 @@ type Actor struct {
 // Identity returns the bounded audit-safe representation of the actor.
 func (a Actor) Identity() string {
 	return "uid:" + decimal(a.UID) + "/gid:" + decimal(a.GID)
+}
+
+// ApprovalRequest is the strict local IPC payload for one administrator
+// decision. The Decision must agree with the selected approval operation.
+type ApprovalRequest struct {
+	// CommandID identifies one durable recovery command awaiting approval.
+	CommandID string `json:"command_id"`
+	// Decision is grant or deny for the command.
+	Decision contract.ApprovalDecision `json:"decision"`
+	// ExpiresAt bounds the approval decision.
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ApprovalResult is the bounded local IPC response to one persisted decision.
+type ApprovalResult struct {
+	// SchemaVersion is the response contract version.
+	SchemaVersion string `json:"schema_version"`
+	// ApprovalID identifies the immutable local decision.
+	ApprovalID string `json:"approval_id"`
+	// CommandID identifies the command associated with the decision.
+	CommandID string `json:"command_id"`
+	// Decision is the accepted local grant or denial.
+	Decision contract.ApprovalDecision `json:"decision"`
+	// CommandState is the durable command state after the decision.
+	CommandState contract.RecoveryCommandState `json:"command_state"`
+	// ExpiresAt is the persisted decision expiry.
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // Status is the bounded result of an authenticated daemon status request.
@@ -128,6 +160,7 @@ type Request struct {
 	Target *contract.ServiceTarget `json:"target,omitempty"`
 	// Runbook is present only for a runbook registration request.
 	Runbook        *contract.Runbook `json:"runbook,omitempty"`
+	Approval       *ApprovalRequest  `json:"approval,omitempty"`
 	IncidentFilter *incident.Filter  `json:"incident_filter,omitempty"`
 	IncidentID     string            `json:"incident_id,omitempty"`
 }
@@ -140,16 +173,17 @@ const (
 )
 
 type response struct {
-	SchemaVersion string                      `json:"schema_version"`
-	RequestID     string                      `json:"request_id,omitempty"`
-	Result        result                      `json:"result"`
-	ErrorCode     string                      `json:"error_code,omitempty"`
-	Status        *Status                     `json:"status,omitempty"`
-	BackupSize    int64                       `json:"backup_size,omitempty"`
-	TargetResult  *target.RegistrationResult  `json:"target_result,omitempty"`
-	RunbookResult *runbook.RegistrationResult `json:"runbook_result,omitempty"`
-	IncidentPage  *incident.Page              `json:"incident_page,omitempty"`
-	Incident      *contract.Incident          `json:"incident,omitempty"`
+	SchemaVersion  string                      `json:"schema_version"`
+	RequestID      string                      `json:"request_id,omitempty"`
+	Result         result                      `json:"result"`
+	ErrorCode      string                      `json:"error_code,omitempty"`
+	Status         *Status                     `json:"status,omitempty"`
+	BackupSize     int64                       `json:"backup_size,omitempty"`
+	TargetResult   *target.RegistrationResult  `json:"target_result,omitempty"`
+	RunbookResult  *runbook.RegistrationResult `json:"runbook_result,omitempty"`
+	ApprovalResult *ApprovalResult             `json:"approval_result,omitempty"`
+	IncidentPage   *incident.Page              `json:"incident_page,omitempty"`
+	Incident       *contract.Incident          `json:"incident,omitempty"`
 }
 
 func (r Request) validate() error {
@@ -158,23 +192,31 @@ func (r Request) validate() error {
 	}
 	switch r.Operation {
 	case OperationTargetRegister:
-		if r.Target == nil || r.Target.SchemaVersion != SchemaVersion || r.Runbook != nil {
+		if r.Target == nil || r.Target.SchemaVersion != SchemaVersion || r.Runbook != nil || r.Approval != nil || r.IncidentFilter != nil || r.IncidentID != "" {
 			return ErrMalformedRequest
 		}
 	case OperationRunbookRegister:
-		if r.Runbook == nil || r.Runbook.SchemaVersion != SchemaVersion || r.Target != nil {
+		if r.Runbook == nil || r.Runbook.SchemaVersion != SchemaVersion || r.Target != nil || r.Approval != nil || r.IncidentFilter != nil || r.IncidentID != "" {
+			return ErrMalformedRequest
+		}
+	case OperationApprovalGrant:
+		if !validApprovalRequest(r.Approval, contract.ApprovalGranted) || r.Target != nil || r.Runbook != nil || r.IncidentFilter != nil || r.IncidentID != "" {
+			return ErrMalformedRequest
+		}
+	case OperationApprovalDeny:
+		if !validApprovalRequest(r.Approval, contract.ApprovalDenied) || r.Target != nil || r.Runbook != nil || r.IncidentFilter != nil || r.IncidentID != "" {
 			return ErrMalformedRequest
 		}
 	case OperationIncidentList:
-		if r.IncidentFilter == nil || r.IncidentID != "" || r.Target != nil || r.Runbook != nil || !validIncidentFilter(*r.IncidentFilter) {
+		if r.IncidentFilter == nil || r.IncidentID != "" || r.Target != nil || r.Runbook != nil || r.Approval != nil || !validIncidentFilter(*r.IncidentFilter) {
 			return ErrMalformedRequest
 		}
 	case OperationIncidentShow:
-		if r.IncidentID == "" || r.IncidentFilter != nil || r.Target != nil || r.Runbook != nil {
+		if r.IncidentID == "" || r.IncidentFilter != nil || r.Target != nil || r.Runbook != nil || r.Approval != nil {
 			return ErrMalformedRequest
 		}
 	default:
-		if r.Target != nil || r.Runbook != nil || r.IncidentFilter != nil || r.IncidentID != "" {
+		if r.Target != nil || r.Runbook != nil || r.Approval != nil || r.IncidentFilter != nil || r.IncidentID != "" {
 			return ErrMalformedRequest
 		}
 	}
@@ -200,7 +242,7 @@ func (r response) validate() error {
 	if r.Status != nil && !r.Status.valid() {
 		return ErrMalformedResponse
 	}
-	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) || (r.RunbookResult != nil && !validRunbookResult(*r.RunbookResult)) || (r.IncidentPage != nil && !validIncidentPage(*r.IncidentPage)) || (r.Incident != nil && r.Incident.Validate() != nil) {
+	if r.BackupSize < 0 || (r.TargetResult != nil && !validTargetResult(*r.TargetResult)) || (r.RunbookResult != nil && !validRunbookResult(*r.RunbookResult)) || (r.ApprovalResult != nil && !validApprovalResult(*r.ApprovalResult)) || (r.IncidentPage != nil && !validIncidentPage(*r.IncidentPage)) || (r.Incident != nil && r.Incident.Validate() != nil) {
 		return ErrMalformedResponse
 	}
 	return nil
@@ -218,6 +260,9 @@ func responsePayloadCount(value response) int {
 		count++
 	}
 	if value.RunbookResult != nil {
+		count++
+	}
+	if value.ApprovalResult != nil {
 		count++
 	}
 	if value.IncidentPage != nil {
@@ -240,6 +285,14 @@ func validRunbookResult(result runbook.RegistrationResult) bool {
 	return result.SchemaVersion == SchemaVersion && result.RunbookID != "" && result.Digest != ""
 }
 
+func validApprovalRequest(request *ApprovalRequest, decision contract.ApprovalDecision) bool {
+	return request != nil && validCode(request.CommandID, maxRequestIDBytes) && request.Decision == decision && !request.ExpiresAt.IsZero()
+}
+
+func validApprovalResult(result ApprovalResult) bool {
+	return result.SchemaVersion == SchemaVersion && validCode(result.ApprovalID, maxRequestIDBytes) && validCode(result.CommandID, maxRequestIDBytes) && (result.Decision == contract.ApprovalGranted || result.Decision == contract.ApprovalDenied) && (result.CommandState == contract.RecoveryPending || result.CommandState == contract.RecoveryDenied) && !result.ExpiresAt.IsZero()
+}
+
 func (s Status) valid() bool {
 	if s.SchemaVersion != SchemaVersion || s.State != StatusRunning || len(s.Capabilities) == 0 {
 		return false
@@ -258,7 +311,7 @@ func (s Status) valid() bool {
 }
 
 func validOperation(operation Operation) bool {
-	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister || operation == OperationRunbookRegister || operation == OperationIncidentList || operation == OperationIncidentShow
+	return operation == OperationStatus || operation == OperationBackup || operation == OperationTargetRegister || operation == OperationRunbookRegister || operation == OperationApprovalGrant || operation == OperationApprovalDeny || operation == OperationIncidentList || operation == OperationIncidentShow
 }
 
 func validIncidentFilter(filter incident.Filter) bool {
