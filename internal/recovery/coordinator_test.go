@@ -1,0 +1,500 @@
+package recovery
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"pulse-agent/internal/contract"
+	"pulse-agent/internal/docker"
+	"pulse-agent/internal/policy"
+	"pulse-agent/internal/store"
+)
+
+func TestCoordinator_SubmitPersistsPendingBeforeAdapterExecution(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+	clock := &sequenceClock{times: []time.Time{now, now}}
+	coordinator := newCoordinator(t, state, adapter, clock)
+	request := testRequest(now)
+	pendingObserved := false
+	adapter.onValidate = func() {
+		stored := readRecord(t, state, contract.RecoveryCommand{
+			IncidentID:    request.IncidentID,
+			RunbookID:     request.PolicyInput.RunbookID,
+			RunbookDigest: request.PolicyInput.RunbookDigest,
+			TargetID:      request.Target.TargetID,
+			ActionIndex:   request.PolicyInput.ActionIndex,
+		})
+		if stored.Phase != phasePending || stored.Command.State != contract.RecoveryPending {
+			t.Fatalf("journal before ValidateAction() = phase=%q state=%q, want pending", stored.Phase, stored.Command.State)
+		}
+		if stored.Command.IncidentID != request.IncidentID || stored.Command.RunbookDigest != request.PolicyInput.RunbookDigest || stored.Command.TargetID != request.Target.TargetID || stored.Command.ActionIndex != request.PolicyInput.ActionIndex || stored.Command.ExpiresAt != request.ExpiresAt || stored.Command.IdempotencyKey != request.IdempotencyKey || stored.Command.CommandID == "" {
+			t.Fatalf("pending journal command = %#v, want durable command fields", stored.Command)
+		}
+		pendingObserved = true
+	}
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Outcome != OutcomeExecuted || result.Command.State != contract.RecoverySucceeded || !pendingObserved {
+		t.Fatalf("Submit() = %#v, pendingObserved=%t, want successful pending-first execution", result, pendingObserved)
+	}
+	if adapter.validateCalls != 1 || adapter.executeCalls != 1 {
+		t.Fatalf("adapter calls = validate=%d execute=%d, want 1 each", adapter.validateCalls, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Phase != phaseCompleted || stored.Command.State != contract.RecoverySucceeded {
+		t.Fatalf("stored command = phase=%q state=%q, want completed/succeeded", stored.Phase, stored.Command.State)
+	}
+}
+
+func TestCoordinator_ExecutionRevalidatesChangedPolicyFacts(t *testing.T) {
+	now := testNow()
+	tests := []struct {
+		name       string
+		mutate     func(*Request)
+		wantReason policy.ReasonCode
+	}{
+		{
+			name: "forged digest",
+			mutate: func(request *Request) {
+				request.PolicySnapshot.Runbooks[0].Runbook.Digest = "changed-digest"
+			},
+			wantReason: policy.ReasonForgedDigest,
+		},
+		{
+			name: "target registration changed",
+			mutate: func(request *Request) {
+				request.PolicySnapshot.Runbooks[0].TargetID = "other-target"
+			},
+			wantReason: policy.ReasonTargetMismatch,
+		},
+		{
+			name: "target selector changed",
+			mutate: func(request *Request) {
+				request.Target.Selector = "container:replacement"
+			},
+			wantReason: policy.ReasonInvalidPolicy,
+		},
+		{
+			name: "precondition no longer holds",
+			mutate: func(request *Request) {
+				request.PolicyInput.Preconditions["docker_healthy"] = false
+			},
+			wantReason: policy.ReasonPreconditionFailed,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := openState(t)
+			adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+			coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
+			request := testRequest(now)
+			record, duplicate, decision, err := coordinator.prepare(request, now)
+			if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
+				t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
+			}
+			test.mutate(&request)
+
+			result, err := coordinator.execute(context.Background(), request, record)
+			if err != nil {
+				t.Fatalf("execute() error = %v", err)
+			}
+			if result.Outcome != OutcomeDenied || result.Decision.ReasonCode != test.wantReason {
+				t.Fatalf("execute() = %#v, want denied/%q", result, test.wantReason)
+			}
+			if adapter.validateCalls != 0 || adapter.executeCalls != 0 {
+				t.Fatalf("adapter calls = validate=%d execute=%d, want no adapter call", adapter.validateCalls, adapter.executeCalls)
+			}
+			stored := readRecord(t, state, record.Command)
+			if stored.Phase != phaseCompleted || stored.Command.State != contract.RecoveryDenied {
+				t.Fatalf("stored command = phase=%q state=%q, want completed/denied", stored.Phase, stored.Command.State)
+			}
+		})
+	}
+}
+
+func TestCoordinator_SubmitRejectsCurrentReplicaCountBeforeExecute(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{validateErr: docker.ErrAmbiguousTarget}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now}})
+
+	result, err := coordinator.Submit(context.Background(), testRequest(now))
+	if !errors.Is(err, docker.ErrAmbiguousTarget) {
+		t.Fatalf("Submit() error = %v, want current-replica validation error", err)
+	}
+	if result.Outcome != OutcomeDenied || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, execute calls=%d, want denied with no execution", result, adapter.executeCalls)
+	}
+	if adapter.validateCalls != 1 {
+		t.Fatalf("ValidateAction() calls = %d, want 1", adapter.validateCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Command.State != contract.RecoveryDenied {
+		t.Fatalf("stored state = %q, want denied", stored.Command.State)
+	}
+}
+
+func TestCoordinator_SubmitExpiresImmediatelyBeforeExecute(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	request := testRequest(now)
+	request.ExpiresAt = now.Add(time.Minute)
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, request.ExpiresAt}})
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Outcome != OutcomeExpired || adapter.validateCalls != 0 || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, calls=%d/%d, want expired before adapter execution", result, adapter.validateCalls, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Command.State != contract.RecoveryExpired {
+		t.Fatalf("stored state = %q, want expired", stored.Command.State)
+	}
+}
+
+func TestCoordinator_DuplicateDeliveriesProduceAtMostOneEffect(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}})
+	firstRequest := testRequest(now)
+
+	first, err := coordinator.Submit(context.Background(), firstRequest)
+	if err != nil || first.Outcome != OutcomeExecuted {
+		t.Fatalf("first Submit() = %#v, %v, want executed", first, err)
+	}
+	secondRequest := firstRequest
+	secondRequest.IdempotencyKey = "delivery-retry-2"
+	second, err := coordinator.Submit(context.Background(), secondRequest)
+	if err != nil {
+		t.Fatalf("second Submit() error = %v", err)
+	}
+	if !second.Duplicate || second.Outcome != OutcomeDuplicate || second.Command.CommandID != first.Command.CommandID {
+		t.Fatalf("second Submit() = %#v, want duplicate of %#v", second, first.Command)
+	}
+	if adapter.executeCalls != 1 {
+		t.Fatalf("Execute() calls = %d, want exactly one effect", adapter.executeCalls)
+	}
+}
+
+func TestCoordinator_ExecuteErrorStaysUncertainWithoutReplay(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{executeErr: errors.New("SDK outcome unknown")}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}})
+	request := testRequest(now)
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err == nil {
+		t.Fatal("Submit() error = nil, want adapter error")
+	}
+	if result.Outcome != OutcomeVerifyAndNotify || result.Command.State != contract.RecoveryExecuting {
+		t.Fatalf("Submit() = %#v, want uncertain executing command", result)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Phase != phaseVerifyAndNotify || stored.Reconciliation == nil || stored.Reconciliation.Verified {
+		t.Fatalf("stored record = %#v, want unverified verify_and_notify", stored)
+	}
+	retry, retryErr := coordinator.Submit(context.Background(), request)
+	if retryErr != nil {
+		t.Fatalf("retry Submit() error = %v", retryErr)
+	}
+	if !retry.Duplicate || retry.Outcome != OutcomeVerifyAndNotify || adapter.executeCalls != 1 {
+		t.Fatalf("retry Submit() = %#v, execute calls=%d, want no replay", retry, adapter.executeCalls)
+	}
+}
+
+func TestCoordinator_SubmitPersistsApprovalWaitWithoutExecution(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
+	request := testRequest(now)
+	request.PolicySnapshot.Runbooks[0].Runbook.RiskTier = contract.RiskHigh
+	request.PolicySnapshot.Runbooks[0].Runbook.AutoExecute = false
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if result.Outcome != OutcomeAwaitApproval || result.Command.State != contract.RecoveryPending || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, execute calls=%d, want durable approval wait", result, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Phase != phaseAwaitingApproval {
+		t.Fatalf("stored phase = %q, want awaiting approval", stored.Phase)
+	}
+	results, err := coordinator.Reconcile(context.Background())
+	if err != nil || len(results) != 0 {
+		t.Fatalf("Reconcile() = %#v, %v, want approval wait unchanged", results, err)
+	}
+}
+
+func TestCoordinator_ReconcileProcessStopsWithoutRepeatingEffect(t *testing.T) {
+	now := testNow()
+	tests := []struct {
+		name             string
+		simulateStop     func(t *testing.T, coordinator *Coordinator, adapter *fakeAdapter, record journalRecord)
+		wantExecuteCalls int
+		wantState        contract.RecoveryCommandState
+	}{
+		{
+			name:             "immediately after pending write",
+			simulateStop:     func(_ *testing.T, _ *Coordinator, _ *fakeAdapter, _ journalRecord) {},
+			wantExecuteCalls: 0,
+			wantState:        contract.RecoveryPending,
+		},
+		{
+			name: "after execution state before SDK call",
+			simulateStop: func(t *testing.T, coordinator *Coordinator, _ *fakeAdapter, record journalRecord) {
+				t.Helper()
+				if _, err := coordinator.approve(recordKey(record.Command)); err != nil {
+					t.Fatalf("approve() error = %v", err)
+				}
+				if _, err := coordinator.startExecution(recordKey(record.Command)); err != nil {
+					t.Fatalf("startExecution() error = %v", err)
+				}
+			},
+			wantExecuteCalls: 0,
+			wantState:        contract.RecoveryExecuting,
+		},
+		{
+			name: "after SDK accepted before durable result",
+			simulateStop: func(t *testing.T, coordinator *Coordinator, adapter *fakeAdapter, record journalRecord) {
+				t.Helper()
+				if _, err := coordinator.approve(recordKey(record.Command)); err != nil {
+					t.Fatalf("approve() error = %v", err)
+				}
+				executing, err := coordinator.startExecution(recordKey(record.Command))
+				if err != nil {
+					t.Fatalf("startExecution() error = %v", err)
+				}
+				if err := adapter.Execute(context.Background(), executing.Target, executing.Action); err != nil {
+					t.Fatalf("fake Execute() error = %v", err)
+				}
+			},
+			wantExecuteCalls: 1,
+			wantState:        contract.RecoveryExecuting,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := openState(t)
+			adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+			coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
+			request := testRequest(now)
+			record, duplicate, decision, err := coordinator.prepare(request, now)
+			if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
+				t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
+			}
+			test.simulateStop(t, coordinator, adapter, record)
+
+			restarted := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now.Add(time.Minute)}})
+			results, err := restarted.Reconcile(context.Background())
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if len(results) != 1 || results[0].Outcome != OutcomeVerifyAndNotify || !results[0].Verified {
+				t.Fatalf("Reconcile() = %#v, want one verified verify_and_notify result", results)
+			}
+			if adapter.executeCalls != test.wantExecuteCalls {
+				t.Fatalf("Execute() calls after reconciliation = %d, want %d", adapter.executeCalls, test.wantExecuteCalls)
+			}
+			stored := readRecord(t, state, record.Command)
+			if stored.Phase != phaseVerifyAndNotify || stored.Command.State != test.wantState || stored.Reconciliation == nil || !stored.Reconciliation.Verified {
+				t.Fatalf("reconciled record = %#v, want verify_and_notify without state replay", stored)
+			}
+		})
+	}
+}
+
+func TestCoordinator_ReconcileVerificationFailureStaysFailClosed(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{verifyErr: errors.New("docker unavailable")}
+	coordinator := newCoordinator(t, state, adapter, &sequenceClock{times: []time.Time{now}})
+	record, duplicate, decision, err := coordinator.prepare(testRequest(now), now)
+	if err != nil || duplicate || decision.Verdict != policy.VerdictAllow {
+		t.Fatalf("prepare() = record=%#v duplicate=%t decision=%#v err=%v, want new allow", record, duplicate, decision, err)
+	}
+
+	results, err := coordinator.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Verified || adapter.executeCalls != 0 {
+		t.Fatalf("Reconcile() = %#v, execute calls=%d, want unverified fail-closed result", results, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, record.Command)
+	if stored.Phase != phaseVerifyAndNotify || stored.Reconciliation == nil || stored.Reconciliation.Verified {
+		t.Fatalf("stored record = %#v, want durable unverified verify_and_notify", stored)
+	}
+}
+
+type fakeAdapter struct {
+	validateErr   error
+	executeErr    error
+	verifyErr     error
+	snapshot      docker.Snapshot
+	onValidate    func()
+	validateCalls int
+	executeCalls  int
+	verifyCalls   int
+}
+
+func (a *fakeAdapter) ValidateAction(_ context.Context, _ contract.ServiceTarget, _ contract.TypedAction) error {
+	a.validateCalls++
+	if a.onValidate != nil {
+		a.onValidate()
+	}
+	return a.validateErr
+}
+
+func (a *fakeAdapter) Execute(_ context.Context, _ contract.ServiceTarget, _ contract.TypedAction) error {
+	a.executeCalls++
+	return a.executeErr
+}
+
+func (a *fakeAdapter) Verify(_ context.Context, _ contract.ServiceTarget) (docker.Snapshot, error) {
+	a.verifyCalls++
+	if a.verifyErr != nil {
+		return docker.Snapshot{}, a.verifyErr
+	}
+	return a.snapshot, nil
+}
+
+type sequenceClock struct {
+	times []time.Time
+	index int
+}
+
+func (c *sequenceClock) Now() time.Time {
+	if len(c.times) == 0 {
+		return time.Time{}
+	}
+	if c.index >= len(c.times) {
+		return c.times[len(c.times)-1]
+	}
+	now := c.times[c.index]
+	c.index++
+	return now
+}
+
+func newCoordinator(t *testing.T, state *store.Store, adapter Adapter, clock Clock) *Coordinator {
+	t.Helper()
+	nextID := 0
+	coordinator, err := New(Options{
+		State:   state,
+		Adapter: adapter,
+		Clock:   clock,
+		NewCommandID: func() (string, error) {
+			nextID++
+			return fmt.Sprintf("command-%d", nextID), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return coordinator
+}
+
+func openState(t *testing.T) *store.Store {
+	t.Helper()
+	state, err := store.Open(store.Options{Path: filepath.Join(t.TempDir(), "state.db"), LockTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := state.Close(); err != nil {
+			t.Errorf("Store.Close() error = %v", err)
+		}
+	})
+	return state
+}
+
+func readRecord(t *testing.T, state *store.Store, command contract.RecoveryCommand) journalRecord {
+	t.Helper()
+	var record journalRecord
+	err := state.View(func(tx *store.Tx) error {
+		var (
+			found bool
+			err   error
+		)
+		record, found, err = loadRecord(tx, recordKey(command))
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrCorruptJournal
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read recovery record error = %v", err)
+	}
+	return record
+}
+
+func testRequest(now time.Time) Request {
+	target := contract.ServiceTarget{
+		SchemaVersion: contract.SchemaVersionV1,
+		TargetID:      "target-web",
+		AdapterType:   docker.AdapterType,
+		Selector:      "container:web",
+		Enabled:       true,
+	}
+	runbook := contract.Runbook{
+		SchemaVersion: contract.SchemaVersionV1,
+		RunbookID:     "restart-web",
+		Digest:        "digest-web",
+		AdapterType:   docker.AdapterType,
+		TypedActions: []contract.TypedAction{{
+			ActionType:     contract.ActionDockerContainerRestart,
+			TargetSelector: target.Selector,
+			StopTimeout:    contract.NewDuration(time.Second),
+			Cooldown:       contract.NewDuration(time.Minute),
+		}},
+		RiskTier:      contract.RiskLow,
+		AutoExecute:   true,
+		Preconditions: []string{"docker_healthy"},
+		RetryPolicy:   contract.RetryPolicy{MaxAttempts: 2},
+		StabilizationPolicy: contract.StabilizationPolicy{
+			RecoverySamples: 2,
+			Window:          contract.NewDuration(time.Minute),
+		},
+	}
+	return Request{
+		IncidentID: "incident-1",
+		Target:     target,
+		PolicySnapshot: policy.Snapshot{
+			Runbooks:            []policy.RegisteredRunbook{{Runbook: runbook, TargetID: target.TargetID}},
+			AuthorizedApprovers: []string{"operator-1"},
+		},
+		PolicyInput: policy.Input{
+			RunbookID:     runbook.RunbookID,
+			RunbookDigest: runbook.Digest,
+			TargetID:      target.TargetID,
+			ActionIndex:   0,
+			Preconditions: map[string]bool{"docker_healthy": true},
+			AttemptCount:  0,
+		},
+		ExpiresAt:      now.Add(5 * time.Minute),
+		IdempotencyKey: "delivery-1",
+	}
+}
+
+func testNow() time.Time {
+	return time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+}
