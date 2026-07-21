@@ -58,6 +58,19 @@ type StateSource interface {
 	Load(context.Context, contract.RecoveryCommand) (ExecutionState, error)
 }
 
+// LifecyclePublisher records required lifecycle events before recovery may
+// advance. It must durably enqueue each event but must not perform HTTP I/O.
+type LifecyclePublisher interface {
+	// PublishAnalysisUnavailable records a model-unavailable event for one request.
+	PublishAnalysisUnavailable(context.Context, string, string, string) error
+	// PublishPolicyDenied records a policy denial for one request.
+	PublishPolicyDenied(context.Context, string, string, string) error
+	// PublishApprovalRequested records a pending approval for a durable command.
+	PublishApprovalRequested(context.Context, contract.RecoveryCommand) error
+	// PublishRecoveryStarted records a durable pre-Docker event for a command.
+	PublishRecoveryStarted(context.Context, contract.RecoveryCommand) error
+}
+
 // ExecutionState is the current daemon-owned authorization context for one
 // persisted recovery command. Its fields are read-only at the coordinator
 // boundary and must describe the same runbook, target, and action as Command.
@@ -82,6 +95,9 @@ type Options struct {
 	Clock Clock
 	// NewCommandID creates an immutable identifier for a new recovery command.
 	NewCommandID func() (string, error)
+	// LifecyclePublisher records durable events before recovery advances. Nil
+	// preserves the coordinator-only embedding used before notification wiring.
+	LifecyclePublisher LifecyclePublisher
 }
 
 // Coordinator persists a recovery command before invoking a Docker adapter.
@@ -92,6 +108,7 @@ type Coordinator struct {
 	stateSource  StateSource
 	clock        Clock
 	newCommandID func() (string, error)
+	publisher    LifecyclePublisher
 }
 
 // Request is the current local authorization context for one recovery effect.
@@ -170,6 +187,7 @@ func New(options Options) (*Coordinator, error) {
 		stateSource:  options.StateSource,
 		clock:        options.Clock,
 		newCommandID: options.NewCommandID,
+		publisher:    options.LifecyclePublisher,
 	}, nil
 }
 
@@ -190,15 +208,28 @@ func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, erro
 	if !now.Before(request.ExpiresAt) {
 		return Result{Outcome: OutcomeExpired}, nil
 	}
+	if !request.PolicyInput.AnalysisAvailable {
+		if err := c.publishAnalysisUnavailable(ctx, request); err != nil {
+			return Result{}, err
+		}
+	}
 
 	record, duplicate, decision, err := c.prepare(request, now)
 	if err != nil {
 		return Result{}, err
 	}
 	if decision.Verdict == policy.VerdictDeny {
+		if err := c.publishPolicyDenied(ctx, request, decision); err != nil {
+			return Result{}, err
+		}
 		return Result{Outcome: OutcomeDenied, Decision: decision}, nil
 	}
 	if duplicate {
+		if decision.Verdict == policy.VerdictAwaitApproval {
+			if err := c.publishApprovalRequested(ctx, record.Command); err != nil {
+				return Result{}, err
+			}
+		}
 		return Result{
 			Command:   record.Command,
 			Outcome:   existingOutcome(record),
@@ -207,6 +238,9 @@ func (c *Coordinator) Submit(ctx context.Context, request Request) (Result, erro
 		}, nil
 	}
 	if decision.Verdict == policy.VerdictAwaitApproval {
+		if err := c.publishApprovalRequested(ctx, record.Command); err != nil {
+			return Result{}, err
+		}
 		return Result{Command: record.Command, Outcome: OutcomeAwaitApproval, Decision: decision}, nil
 	}
 	if decision.Verdict != policy.VerdictAllow {
@@ -369,6 +403,9 @@ func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result
 	if decision.Verdict != policy.VerdictAllow {
 		return c.denyAfterRevalidation(record, decision, nil)
 	}
+	if err := c.publishRecoveryStarted(ctx, record.Command); err != nil {
+		return Result{Command: record.Command, Decision: decision}, fmt.Errorf("publish recovery started: %w", err)
+	}
 
 	if record.Phase != phaseApproved {
 		if _, err := c.approve(recordKey(record.Command)); err != nil {
@@ -391,6 +428,46 @@ func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result
 		return Result{}, err
 	}
 	return Result{Command: stabilizing.Command, Outcome: OutcomeStabilizing, Decision: decision}, nil
+}
+
+func (c *Coordinator) publishAnalysisUnavailable(ctx context.Context, request Request) error {
+	if c.publisher == nil {
+		return nil
+	}
+	if err := c.publisher.PublishAnalysisUnavailable(ctx, request.IncidentID, request.IdempotencyKey, "analysis_unavailable"); err != nil {
+		return fmt.Errorf("publish analysis unavailable: %w", err)
+	}
+	return nil
+}
+
+func (c *Coordinator) publishPolicyDenied(ctx context.Context, request Request, decision policy.Decision) error {
+	if c.publisher == nil {
+		return nil
+	}
+	if err := c.publisher.PublishPolicyDenied(ctx, request.IncidentID, request.IdempotencyKey, string(decision.ReasonCode)); err != nil {
+		return fmt.Errorf("publish policy denied: %w", err)
+	}
+	return nil
+}
+
+func (c *Coordinator) publishApprovalRequested(ctx context.Context, command contract.RecoveryCommand) error {
+	if c.publisher == nil {
+		return nil
+	}
+	if err := c.publisher.PublishApprovalRequested(ctx, command); err != nil {
+		return fmt.Errorf("publish approval requested: %w", err)
+	}
+	return nil
+}
+
+func (c *Coordinator) publishRecoveryStarted(ctx context.Context, command contract.RecoveryCommand) error {
+	if c.publisher == nil {
+		return nil
+	}
+	if err := c.publisher.PublishRecoveryStarted(ctx, command); err != nil {
+		return fmt.Errorf("publish recovery started: %w", err)
+	}
+	return nil
 }
 
 // CompleteStabilization records the terminal result of a separate post-recovery

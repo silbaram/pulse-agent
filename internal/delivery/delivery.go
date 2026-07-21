@@ -143,6 +143,10 @@ type Result struct {
 	ReasonCode string
 }
 
+// Mutation adds a related durable record to the same transaction that accepts
+// a delivery queue item. A mutation must not perform external I/O.
+type Mutation func(*store.Tx) error
+
 type storedItem struct {
 	key  string
 	item contract.DeliveryQueueItem
@@ -176,10 +180,31 @@ func New(options Options) (*Dispatcher, error) {
 	}, nil
 }
 
+// UsesStore reports whether the dispatcher uses state for its delivery queue.
+// It lets a payload publisher reject a configuration that cannot commit its
+// payload and queue item in the same local-state transaction.
+func (d *Dispatcher) UsesStore(state *store.Store) bool {
+	return d != nil && state != nil && d.state == state
+}
+
 // Enqueue records one typed payload reference before it may be sent. It stores
 // no payload bytes, endpoint, or secret, and returns a stable webhook ID that
 // is reused for every retry of the same logical delivery.
 func (d *Dispatcher) Enqueue(request EnqueueRequest) (contract.DeliveryQueueItem, error) {
+	return d.enqueue(request, nil)
+}
+
+// EnqueueWithMutation atomically records a related local-state mutation and a
+// delivery queue item. It is for daemon-owned payload publishers that must
+// persist an exact payload before the queue may reference it.
+func (d *Dispatcher) EnqueueWithMutation(request EnqueueRequest, mutation Mutation) (contract.DeliveryQueueItem, error) {
+	if mutation == nil {
+		return contract.DeliveryQueueItem{}, ErrInvalidRequest
+	}
+	return d.enqueue(request, mutation)
+}
+
+func (d *Dispatcher) enqueue(request EnqueueRequest, mutation Mutation) (contract.DeliveryQueueItem, error) {
 	if d == nil || validateEnqueueRequest(request, d.destinations) != nil {
 		return contract.DeliveryQueueItem{}, ErrInvalidRequest
 	}
@@ -214,6 +239,11 @@ func (d *Dispatcher) Enqueue(request EnqueueRequest) (contract.DeliveryQueueItem
 		State:          contract.DeliveryPending,
 	}
 	if err := d.state.Update(func(transaction *store.Tx) error {
+		if mutation != nil {
+			if err := mutation(transaction); err != nil {
+				return err
+			}
+		}
 		pending, err := countPending(transaction)
 		if err != nil {
 			return err

@@ -326,6 +326,99 @@ func TestCoordinator_SubmitPersistsApprovalWaitWithoutExecution(t *testing.T) {
 	}
 }
 
+func TestCoordinator_LifecyclePublisherQueuesRecoveryStartedBeforeDockerExecute(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{snapshot: docker.Snapshot{TargetID: "target-web", Running: true, Healthy: true}}
+	publisher := &fakeLifecyclePublisher{}
+	coordinator := newCoordinatorWithPublisher(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}}, publisher)
+	journalObserved := false
+	publisher.onRecoveryStarted = func(command contract.RecoveryCommand) {
+		stored := readRecord(t, state, command)
+		if stored.Command.CommandID != command.CommandID || stored.Phase != phasePending {
+			t.Fatalf("journal at recovery.started = %#v, want durable pending command", stored)
+		}
+		journalObserved = true
+	}
+	adapter.onExecute = func() {
+		if !journalObserved || !publisher.hasCall("recovery.started") {
+			t.Fatal("Docker Execute() ran before durable recovery.started publication")
+		}
+	}
+
+	request := testRequest(now)
+	request.PolicyInput.AnalysisAvailable = true
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil || result.Outcome != OutcomeStabilizing || adapter.executeCalls != 1 || !journalObserved {
+		t.Fatalf("Submit() = %#v, %v, execute=%d, journal=%t", result, err, adapter.executeCalls, journalObserved)
+	}
+}
+
+func TestCoordinator_LifecyclePublisherFailurePreventsDockerExecute(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	publisher := &fakeLifecyclePublisher{err: errors.New("queue unavailable")}
+	coordinator := newCoordinatorWithPublisher(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}}, publisher)
+
+	request := testRequest(now)
+	request.PolicyInput.AnalysisAvailable = true
+	result, err := coordinator.Submit(context.Background(), request)
+	if err == nil || result.Command.CommandID == "" || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, %v, execute=%d, want queue failure before Docker", result, err, adapter.executeCalls)
+	}
+	stored := readRecord(t, state, result.Command)
+	if stored.Phase != phasePending || stored.Command.State != contract.RecoveryPending {
+		t.Fatalf("journal after queue failure = %#v, want pending command", stored)
+	}
+}
+
+func TestCoordinator_LifecyclePublisherKeepsApprovalWaitNonExecutable(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	publisher := &fakeLifecyclePublisher{}
+	coordinator := newCoordinatorWithPublisher(t, state, adapter, &sequenceClock{times: []time.Time{now}}, publisher)
+	request := testRequest(now)
+	request.PolicyInput.AnalysisAvailable = true
+	request.PolicySnapshot.Runbooks[0].Runbook.RiskTier = contract.RiskHigh
+	request.PolicySnapshot.Runbooks[0].Runbook.AutoExecute = false
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil || result.Outcome != OutcomeAwaitApproval || !publisher.hasCall("approval.requested") || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, %v, calls=%#v, execute=%d", result, err, publisher.calls, adapter.executeCalls)
+	}
+}
+
+func TestCoordinator_LifecyclePublisherOrdersUnavailableAnalysisBeforeRecovery(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	publisher := &fakeLifecyclePublisher{}
+	coordinator := newCoordinatorWithPublisher(t, state, adapter, &sequenceClock{times: []time.Time{now, now, now}}, publisher)
+
+	result, err := coordinator.Submit(context.Background(), testRequest(now))
+	if err != nil || result.Outcome != OutcomeStabilizing || len(publisher.calls) != 2 || publisher.calls[0] != "analysis.unavailable" || publisher.calls[1] != "recovery.started" {
+		t.Fatalf("Submit() = %#v, %v, calls=%#v, want ordered analysis and recovery events", result, err, publisher.calls)
+	}
+}
+
+func TestCoordinator_LifecyclePublisherRecordsPolicyDenialWithoutDockerExecute(t *testing.T) {
+	now := testNow()
+	state := openState(t)
+	adapter := &fakeAdapter{}
+	publisher := &fakeLifecyclePublisher{}
+	coordinator := newCoordinatorWithPublisher(t, state, adapter, &sequenceClock{times: []time.Time{now}}, publisher)
+	request := testRequest(now)
+	request.PolicyInput.AnalysisAvailable = true
+	request.PolicyInput.Preconditions["docker_healthy"] = false
+
+	result, err := coordinator.Submit(context.Background(), request)
+	if err != nil || result.Outcome != OutcomeDenied || !publisher.hasCall("policy.denied") || adapter.executeCalls != 0 {
+		t.Fatalf("Submit() = %#v, %v, calls=%#v, execute=%d", result, err, publisher.calls, adapter.executeCalls)
+	}
+}
+
 func TestCoordinator_ReconcileProcessStopsWithoutRepeatingEffect(t *testing.T) {
 	now := testNow()
 	tests := []struct {
@@ -433,6 +526,7 @@ type fakeAdapter struct {
 	verifyErr     error
 	snapshot      docker.Snapshot
 	onValidate    func()
+	onExecute     func()
 	validateCalls int
 	executeCalls  int
 	verifyCalls   int
@@ -448,7 +542,48 @@ func (a *fakeAdapter) ValidateAction(_ context.Context, _ contract.ServiceTarget
 
 func (a *fakeAdapter) Execute(_ context.Context, _ contract.ServiceTarget, _ contract.TypedAction) error {
 	a.executeCalls++
+	if a.onExecute != nil {
+		a.onExecute()
+	}
 	return a.executeErr
+}
+
+type fakeLifecyclePublisher struct {
+	err               error
+	calls             []string
+	onRecoveryStarted func(contract.RecoveryCommand)
+}
+
+func (p *fakeLifecyclePublisher) PublishAnalysisUnavailable(_ context.Context, _ string, _ string, _ string) error {
+	p.calls = append(p.calls, "analysis.unavailable")
+	return p.err
+}
+
+func (p *fakeLifecyclePublisher) PublishPolicyDenied(_ context.Context, _ string, _ string, _ string) error {
+	p.calls = append(p.calls, "policy.denied")
+	return p.err
+}
+
+func (p *fakeLifecyclePublisher) PublishApprovalRequested(_ context.Context, _ contract.RecoveryCommand) error {
+	p.calls = append(p.calls, "approval.requested")
+	return p.err
+}
+
+func (p *fakeLifecyclePublisher) PublishRecoveryStarted(_ context.Context, command contract.RecoveryCommand) error {
+	p.calls = append(p.calls, "recovery.started")
+	if p.onRecoveryStarted != nil {
+		p.onRecoveryStarted(command)
+	}
+	return p.err
+}
+
+func (p *fakeLifecyclePublisher) hasCall(want string) bool {
+	for _, call := range p.calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *fakeAdapter) Verify(_ context.Context, _ contract.ServiceTarget) (docker.Snapshot, error) {
@@ -509,6 +644,26 @@ func newCoordinator(t *testing.T, state *store.Store, adapter Adapter, clock Clo
 			nextID++
 			return fmt.Sprintf("command-%d", nextID), nil
 		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return coordinator
+}
+
+func newCoordinatorWithPublisher(t *testing.T, state *store.Store, adapter Adapter, clock Clock, publisher LifecyclePublisher) *Coordinator {
+	t.Helper()
+	nextID := 0
+	coordinator, err := New(Options{
+		State:       state,
+		Adapter:     adapter,
+		StateSource: &fakeStateSource{state: executionState(testRequest(testNow()))},
+		Clock:       clock,
+		NewCommandID: func() (string, error) {
+			nextID++
+			return fmt.Sprintf("command-%d", nextID), nil
+		},
+		LifecyclePublisher: publisher,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
