@@ -1,0 +1,12 @@
+name: pulse-agent-fault-fixture
+
+services:
+  fault-fixture:
+    build:
+      context: ../..
+      dockerfile: test/faultfixture/Dockerfile
+    image: pulse-agent/fault-fixture:dev
+    labels:
+      com.pulse-agent.fixture: fault-fixture
+    deploy:
+      replicas: 1
