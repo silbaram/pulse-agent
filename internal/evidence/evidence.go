@@ -2,6 +2,7 @@
 package evidence
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/telemetry"
 )
 
 var (
@@ -42,6 +44,8 @@ type Options struct {
 	Retention     time.Duration
 	Clock         func() time.Time
 	NewEvidenceID func() (string, error)
+	// Telemetry records bounded redaction measurements when configured.
+	Telemetry *telemetry.Recorder
 }
 
 // Result contains only redacted evidence and its durable reference.
@@ -59,6 +63,7 @@ type Collector struct {
 	retention time.Duration
 	clock     func() time.Time
 	newID     func() (string, error)
+	telemetry *telemetry.Recorder
 }
 
 // NewCollector validates all bounds before accepting any local evidence.
@@ -83,11 +88,16 @@ func NewCollector(options Options) (*Collector, error) {
 		retention: options.Retention,
 		clock:     options.Clock,
 		newID:     options.NewEvidenceID,
+		telemetry: options.Telemetry,
 	}, nil
 }
 
 // Collect creates a bounded redacted evidence reference for the requested range.
-func (c *Collector) Collect(source, profile string, start, end time.Time, records []Record) (Result, error) {
+func (c *Collector) Collect(source, profile string, start, end time.Time, records []Record) (result Result, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		c.recordRedaction(resultErr, time.Since(startedAt))
+	}()
 	if c == nil || source == "" || profile == "" || start.IsZero() || end.IsZero() || end.Before(start) {
 		return Result{}, ErrInvalidOptions
 	}
@@ -148,6 +158,23 @@ func (c *Collector) Collect(source, profile string, start, end time.Time, record
 		},
 		Content: content,
 	}, nil
+}
+
+func (c *Collector) recordRedaction(collectErr error, duration time.Duration) {
+	if c == nil || c.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if collectErr != nil {
+		result, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		if errors.Is(collectErr, ErrRedactionFailed) || errors.Is(collectErr, ErrInvalidOptions) {
+			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		}
+	}
+	event, err := telemetry.NewEvent(telemetry.ComponentEvidence, telemetry.OperationRedact, result, reason, duration)
+	if err == nil {
+		c.telemetry.RecordBestEffort(context.Background(), event)
+	}
 }
 
 func (c *Collector) redactRecord(fields map[string]string) (string, bool) {

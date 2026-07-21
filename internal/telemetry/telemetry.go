@@ -40,6 +40,12 @@ const (
 	AttributeResult = "pulse.agent.result"
 	// AttributeReason identifies the bounded reason classification.
 	AttributeReason = "pulse.agent.reason"
+	// AttributeTarget identifies the bounded target implementation kind.
+	AttributeTarget = "pulse.agent.target"
+	// AttributeRule identifies the bounded probe signal kind.
+	AttributeRule = "pulse.agent.rule"
+	// AttributeProvider identifies the bounded model-provider kind.
+	AttributeProvider = "pulse.agent.provider"
 )
 
 var (
@@ -67,6 +73,14 @@ const (
 	ComponentWebhook Component = "webhook"
 	// ComponentObserver identifies deterministic direct-observation work.
 	ComponentObserver Component = "observer"
+	// ComponentAlert identifies authenticated external alert validation.
+	ComponentAlert Component = "alert"
+	// ComponentCorrelator identifies deterministic incident correlation.
+	ComponentCorrelator Component = "correlator"
+	// ComponentEvidence identifies local evidence redaction.
+	ComponentEvidence Component = "evidence"
+	// ComponentAnalysis identifies bounded ADK analysis work.
+	ComponentAnalysis Component = "analysis"
 )
 
 // Operation identifies one stable unit of component work. Values are
@@ -84,6 +98,14 @@ const (
 	OperationRequest Operation = "request"
 	// OperationBackup identifies a read-only backup operation.
 	OperationBackup Operation = "backup"
+	// OperationValidate identifies strict input validation.
+	OperationValidate Operation = "validate"
+	// OperationTransition identifies a deterministic state transition.
+	OperationTransition Operation = "transition"
+	// OperationRedact identifies bounded evidence redaction.
+	OperationRedact Operation = "redact"
+	// OperationAnalyze identifies one bounded analysis graph run.
+	OperationAnalyze Operation = "analyze"
 )
 
 // Result identifies the stable result classification of an operation.
@@ -123,21 +145,103 @@ const (
 	ReasonInternal Reason = "internal"
 )
 
+// Target identifies a bounded monitored-target implementation kind.
+type Target string
+
+const (
+	// TargetDocker identifies the only MVP target implementation.
+	TargetDocker Target = "docker"
+)
+
+// Rule identifies a bounded probe signal kind.
+type Rule string
+
+const (
+	// RuleAvailability identifies availability probes.
+	RuleAvailability Rule = "availability"
+	// RuleErrorRate identifies error-rate probes.
+	RuleErrorRate Rule = "error_rate"
+	// RuleLatencyMS identifies latency probes measured in milliseconds.
+	RuleLatencyMS Rule = "latency_ms"
+)
+
+// Provider identifies a bounded analysis model-provider kind.
+type Provider string
+
+const (
+	// ProviderGemini identifies the supported Gemini provider.
+	ProviderGemini Provider = "gemini"
+	// ProviderCustom identifies a caller-supplied model implementation.
+	ProviderCustom Provider = "custom"
+)
+
+// Dimensions supplies optional, bounded semantic attributes for an Event.
+// It intentionally has no incident ID, URL, log, prompt, or credential field.
+type Dimensions struct {
+	Target   Target
+	Rule     Rule
+	Provider Provider
+}
+
+// TargetForAdapter returns the safe telemetry classification for one approved
+// target adapter name.
+func TargetForAdapter(adapter string) (Target, bool) {
+	if adapter == string(TargetDocker) {
+		return TargetDocker, true
+	}
+	return "", false
+}
+
+// RuleForSignal returns the safe telemetry classification for one approved
+// probe signal name.
+func RuleForSignal(signal string) (Rule, bool) {
+	switch Rule(signal) {
+	case RuleAvailability:
+		return RuleAvailability, true
+	case RuleErrorRate:
+		return RuleErrorRate, true
+	case RuleLatencyMS:
+		return RuleLatencyMS, true
+	default:
+		return "", false
+	}
+}
+
+// ProviderForName returns the safe telemetry classification for one supported
+// model provider name.
+func ProviderForName(name string) (Provider, bool) {
+	switch Provider(name) {
+	case ProviderGemini:
+		return ProviderGemini, true
+	case ProviderCustom:
+		return ProviderCustom, true
+	default:
+		return "", false
+	}
+}
+
 // Event is a validated, bounded telemetry record. Construct one only with
 // NewEvent; its fields remain private so arbitrary strings cannot become
 // telemetry attributes.
 type Event struct {
-	component Component
-	operation Operation
-	result    Result
-	reason    Reason
-	duration  time.Duration
+	component  Component
+	operation  Operation
+	result     Result
+	reason     Reason
+	duration   time.Duration
+	dimensions Dimensions
 }
 
 // NewEvent constructs one bounded telemetry event. duration must be
 // non-negative, and all other values must be package-defined constants.
 func NewEvent(component Component, operation Operation, result Result, reason Reason, duration time.Duration) (Event, error) {
-	event := Event{component: component, operation: operation, result: result, reason: reason, duration: duration}
+	return NewEventWithDimensions(component, operation, result, reason, duration, Dimensions{})
+}
+
+// NewEventWithDimensions constructs one bounded telemetry event with optional
+// target, rule, and provider classifications.
+func NewEventWithDimensions(component Component, operation Operation, result Result, reason Reason, duration time.Duration, dimensions Dimensions) (Event, error) {
+	event := Event{component: component, operation: operation, result: result, reason: reason, duration: duration, dimensions: dimensions}
 	if !event.valid() {
 		return Event{}, ErrInvalidEvent
 	}
@@ -237,6 +341,17 @@ func (r *Recorder) Record(ctx context.Context, event Event) error {
 	return nil
 }
 
+// RecordBestEffort records telemetry without allowing a disabled recorder,
+// exporter problem, or invalid caller context to change a domain outcome.
+// Event construction remains strict at the boundary; this method is for
+// instrumentation paths after a domain result has already been determined.
+func (r *Recorder) RecordBestEffort(ctx context.Context, event Event) {
+	if r == nil {
+		return
+	}
+	_ = r.Record(ctx, event)
+}
+
 // ForceFlush requests delivery of pending telemetry. Its error is diagnostic
 // only; callers must not use it to alter domain state or policy decisions.
 func (r *Recorder) ForceFlush(ctx context.Context) error {
@@ -276,7 +391,7 @@ func (r *Recorder) Shutdown(ctx context.Context) error {
 }
 
 func (e Event) valid() bool {
-	return validComponent(e.component) && validOperation(e.operation) && validResult(e.result) && validReason(e.reason) && e.duration >= 0
+	return validComponent(e.component) && validOperation(e.operation) && validResult(e.result) && validReason(e.reason) && validDimensions(e.dimensions) && e.duration >= 0
 }
 
 func (e Event) spanName() string {
@@ -284,17 +399,27 @@ func (e Event) spanName() string {
 }
 
 func (e Event) attributes() []attribute.KeyValue {
-	return []attribute.KeyValue{
+	attributes := []attribute.KeyValue{
 		attribute.String(AttributeComponent, string(e.component)),
 		attribute.String(AttributeOperation, string(e.operation)),
 		attribute.String(AttributeResult, string(e.result)),
 		attribute.String(AttributeReason, string(e.reason)),
 	}
+	if e.dimensions.Target != "" {
+		attributes = append(attributes, attribute.String(AttributeTarget, string(e.dimensions.Target)))
+	}
+	if e.dimensions.Rule != "" {
+		attributes = append(attributes, attribute.String(AttributeRule, string(e.dimensions.Rule)))
+	}
+	if e.dimensions.Provider != "" {
+		attributes = append(attributes, attribute.String(AttributeProvider, string(e.dimensions.Provider)))
+	}
+	return attributes
 }
 
 func validComponent(value Component) bool {
 	switch value {
-	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook, ComponentObserver:
+	case ComponentAdminIPC, ComponentRunbook, ComponentStore, ComponentTarget, ComponentWebhook, ComponentObserver, ComponentAlert, ComponentCorrelator, ComponentEvidence, ComponentAnalysis:
 		return true
 	default:
 		return false
@@ -303,11 +428,17 @@ func validComponent(value Component) bool {
 
 func validOperation(value Operation) bool {
 	switch value {
-	case OperationRead, OperationWrite, OperationRegister, OperationRequest, OperationBackup:
+	case OperationRead, OperationWrite, OperationRegister, OperationRequest, OperationBackup, OperationValidate, OperationTransition, OperationRedact, OperationAnalyze:
 		return true
 	default:
 		return false
 	}
+}
+
+func validDimensions(value Dimensions) bool {
+	return (value.Target == "" || value.Target == TargetDocker) &&
+		(value.Rule == "" || value.Rule == RuleAvailability || value.Rule == RuleErrorRate || value.Rule == RuleLatencyMS) &&
+		(value.Provider == "" || value.Provider == ProviderGemini || value.Provider == ProviderCustom)
 }
 
 func validResult(value Result) bool {

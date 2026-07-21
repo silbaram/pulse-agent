@@ -9,12 +9,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
+	"pulse-agent/internal/telemetry"
 	"pulse-agent/internal/webhook"
 )
 
@@ -195,6 +199,53 @@ func TestIngress_AcceptExpiresReplayReceipts(t *testing.T) {
 	}
 }
 
+func TestIngress_AcceptRecordsBoundedValidationTelemetry(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)
+	keyring, err := webhook.NewKeyring("whsec_MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=")
+	if err != nil {
+		t.Fatalf("NewKeyring() error = %v", err)
+	}
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	ingress := newTestIngress(t, now, keyring, defaultMaxBodyBytes)
+	ingress.telemetry = recorder
+	body := validBody(t, now)
+	headers, err := keyring.Sign("alert-telemetry", now, body)
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+	if _, err := ingress.Accept(context.Background(), headers, body); err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.alert.validate" {
+		t.Fatalf("spans = %#v, want one alert validation span", spans)
+	}
+	attributes := make(map[string]string, len(spans[0].Attributes))
+	for _, value := range spans[0].Attributes {
+		attributes[string(value.Key)] = value.Value.AsString()
+	}
+	for key, want := range map[string]string{telemetry.AttributeTarget: "docker", telemetry.AttributeRule: "availability", telemetry.AttributeResult: "success"} {
+		if attributes[key] != want {
+			t.Errorf("attribute %q = %q, want %q", key, attributes[key], want)
+		}
+	}
+	if strings.Contains(fmt.Sprint(attributes), "external-1") || strings.Contains(fmt.Sprint(attributes), "untrusted") {
+		t.Fatal("telemetry attributes contain raw alert identity or evidence")
+	}
+}
+
 func newTestIngress(t *testing.T, now time.Time, keyring *webhook.Keyring, maxBody int) *Ingress {
 	t.Helper()
 	state, err := store.Open(store.Options{Path: filepath.Join(t.TempDir(), "state.db"), LockTimeout: time.Second})
@@ -213,9 +264,10 @@ func newTestIngress(t *testing.T, now time.Time, keyring *webhook.Keyring, maxBo
 			SchemaVersion: contract.SchemaVersionV1,
 			Version:       1,
 			Targets: []contract.ServiceTarget{{
-				TargetID:   "checkout",
-				Enabled:    true,
-				ProbeRules: []contract.ProbeRule{{RuleID: "availability"}},
+				TargetID:    "checkout",
+				AdapterType: "docker",
+				Enabled:     true,
+				ProbeRules:  []contract.ProbeRule{{RuleID: "availability", SignalType: "availability"}},
 			}},
 		}},
 		Keyring: keyring,

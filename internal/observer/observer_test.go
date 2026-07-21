@@ -7,8 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/target"
+	"pulse-agent/internal/telemetry"
 )
 
 func TestScheduler_RunCycleAppliesIntervalDebounceAndSnapshotVersion(t *testing.T) {
@@ -131,6 +136,66 @@ func TestBoundedValues_ClampsAndLimits(t *testing.T) {
 	}
 }
 
+func TestScheduler_RunCycleRecordsBoundedProbeTelemetry(t *testing.T) {
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	clock := &fakeClock{now: time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)}
+	rule := testRule()
+	source := &fakeTargets{snapshot: target.Snapshot{SchemaVersion: contract.SchemaVersionV1, Version: 1, Targets: []contract.ServiceTarget{{SchemaVersion: contract.SchemaVersionV1, TargetID: "checkout", AdapterType: "docker", Enabled: true, ProbeRules: []contract.ProbeRule{rule}}}}}
+	scheduler, err := NewScheduler(Options{Targets: source, Probe: &fakeProbe{results: []map[string]float64{{"availability": 1}}}, Clock: clock, NewObservationID: func() (string, error) { return "observation-1", nil }, Telemetry: recorder})
+	if err != nil {
+		t.Fatalf("NewScheduler() error = %v", err)
+	}
+	if _, err := scheduler.RunCycle(context.Background()); err != nil {
+		t.Fatalf("RunCycle() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.observer.read" {
+		t.Fatalf("spans = %#v, want one probe span", spans)
+	}
+	attributes := spanAttributes(spans[0].Attributes)
+	for key, want := range map[string]string{telemetry.AttributeTarget: "docker", telemetry.AttributeRule: "availability", telemetry.AttributeResult: "success"} {
+		if attributes[key] != want {
+			t.Errorf("attribute %q = %q, want %q", key, attributes[key], want)
+		}
+	}
+	if attributes[telemetry.AttributeTarget] == "checkout" {
+		t.Fatal("telemetry exposed target ID")
+	}
+}
+
+func TestScheduler_RunCycleIgnoresTelemetryExporterFailure(t *testing.T) {
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: failingSpanExporter{}})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	clock := &fakeClock{now: time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC)}
+	scheduler, err := NewScheduler(Options{Targets: &fakeTargets{snapshot: testSnapshot(1, testRule())}, Probe: &fakeProbe{results: []map[string]float64{{"availability": 1}}}, Clock: clock, NewObservationID: func() (string, error) { return "observation-1", nil }, Telemetry: recorder})
+	if err != nil {
+		t.Fatalf("NewScheduler() error = %v", err)
+	}
+	observations, err := scheduler.RunCycle(context.Background())
+	if err != nil || len(observations) != 1 || observations[0].NormalizedState != contract.StateUnknown {
+		t.Fatalf("RunCycle() = %#v, %v, want unchanged observation despite telemetry failure", observations, err)
+	}
+}
+
 type fakeClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -186,3 +251,19 @@ func testRule() contract.ProbeRule {
 func testSnapshot(version uint64, rule contract.ProbeRule) target.Snapshot {
 	return target.Snapshot{SchemaVersion: contract.SchemaVersionV1, Version: version, Targets: []contract.ServiceTarget{{SchemaVersion: contract.SchemaVersionV1, TargetID: "checkout", Enabled: true, ProbeRules: []contract.ProbeRule{rule}}}}
 }
+
+func spanAttributes(values []attribute.KeyValue) map[string]string {
+	attributes := make(map[string]string, len(values))
+	for _, value := range values {
+		attributes[string(value.Key)] = value.Value.AsString()
+	}
+	return attributes
+}
+
+type failingSpanExporter struct{}
+
+func (failingSpanExporter) ExportSpans(context.Context, []trace.ReadOnlySpan) error {
+	return errors.New("telemetry endpoint unavailable")
+}
+
+func (failingSpanExporter) Shutdown(context.Context) error { return nil }

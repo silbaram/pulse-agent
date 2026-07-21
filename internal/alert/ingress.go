@@ -16,6 +16,7 @@ import (
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/target"
+	"pulse-agent/internal/telemetry"
 	"pulse-agent/internal/webhook"
 )
 
@@ -61,6 +62,8 @@ type Options struct {
 	Timeout time.Duration
 	// Retention bounds the persisted replay-receipt lifetime.
 	Retention time.Duration
+	// Telemetry records bounded alert validation measurements when configured.
+	Telemetry *telemetry.Recorder
 }
 
 // Normalized contains safe alert identity metadata and one observation. It
@@ -72,6 +75,9 @@ type Normalized struct {
 	ExternalAlertID string
 	// Observation contains only bounded, trusted normalized fields.
 	Observation contract.HealthObservation
+
+	targetKind telemetry.Target
+	ruleKind   telemetry.Rule
 }
 
 // Ingress authenticates raw alert bytes before strict decoding and replay storage.
@@ -84,6 +90,7 @@ type Ingress struct {
 	newAuditID         func() (string, error)
 	maxBody            int
 	timeout, retention time.Duration
+	telemetry          *telemetry.Recorder
 }
 
 // NewIngress validates daemon-owned dependencies and safe limits.
@@ -113,6 +120,7 @@ func NewIngress(options Options) (*Ingress, error) {
 		maxBody:    maxBody,
 		timeout:    timeout,
 		retention:  retention,
+		telemetry:  options.Telemetry,
 	}, nil
 }
 
@@ -140,7 +148,11 @@ func (i *Ingress) ServeHTTP(response http.ResponseWriter, request *http.Request)
 
 // Accept verifies the exact raw request before JSON parsing, records its ID
 // transactionally for replay protection, and returns a secret-free normalized alert.
-func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byte) (Normalized, error) {
+func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byte) (normalized Normalized, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		i.recordAccept(ctx, normalized, resultErr, time.Since(startedAt))
+	}()
 	if i == nil || ctx == nil || len(raw) == 0 || len(raw) > i.maxBody {
 		return Normalized{}, ErrInvalidAlert
 	}
@@ -167,7 +179,7 @@ func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byt
 		}
 		return Normalized{}, err
 	}
-	normalized, err := i.normalize(decoded, now)
+	normalized, err = i.normalize(decoded, now)
 	if err != nil {
 		if auditErr := i.recordRejected(now, "unknown_target_or_rule"); auditErr != nil {
 			return Normalized{}, auditErr
@@ -208,6 +220,28 @@ func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byt
 		return Normalized{}, err
 	}
 	return normalized, nil
+}
+
+func (i *Ingress) recordAccept(ctx context.Context, normalized Normalized, acceptErr error, duration time.Duration) {
+	if i == nil || i.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if acceptErr != nil {
+		result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		switch {
+		case errors.Is(acceptErr, context.DeadlineExceeded):
+			result, reason = telemetry.ResultUnavailable, telemetry.ReasonTimeout
+		case errors.Is(acceptErr, context.Canceled):
+			result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		case errors.Is(acceptErr, ErrReplay):
+			reason = telemetry.ReasonDuplicate
+		}
+	}
+	event, err := telemetry.NewEventWithDimensions(telemetry.ComponentAlert, telemetry.OperationValidate, result, reason, duration, telemetry.Dimensions{Target: normalized.targetKind, Rule: normalized.ruleKind})
+	if err == nil {
+		i.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 func (i *Ingress) recordRejected(now time.Time, reason string) error {
@@ -274,13 +308,18 @@ func validateIncoming(value incoming) error {
 
 func (i *Ingress) normalize(value incoming, now time.Time) (Normalized, error) {
 	snapshot := i.targets.Snapshot()
-	var found bool
+	var (
+		candidateTarget contract.ServiceTarget
+		candidateRule   contract.ProbeRule
+		found           bool
+	)
 	for _, candidate := range snapshot.Targets {
 		if !candidate.Enabled || candidate.TargetID != value.TargetID {
 			continue
 		}
 		for _, rule := range candidate.ProbeRules {
 			if rule.RuleID == value.RuleID {
+				candidateTarget, candidateRule = candidate, rule
 				found = true
 				break
 			}
@@ -296,7 +335,7 @@ func (i *Ingress) normalize(value incoming, now time.Time) (Normalized, error) {
 	if err != nil {
 		return Normalized{}, err
 	}
-	return Normalized{
+	normalized := Normalized{
 		Source:          value.Source,
 		ExternalAlertID: value.ExternalAlertID,
 		Observation: contract.HealthObservation{
@@ -311,7 +350,14 @@ func (i *Ingress) normalize(value incoming, now time.Time) (Normalized, error) {
 			EvidenceRefs:          []string{},
 			Sequence:              uint64(now.UnixNano()),
 		},
-	}, nil
+	}
+	if targetKind, ok := telemetry.TargetForAdapter(candidateTarget.AdapterType); ok {
+		normalized.targetKind = targetKind
+	}
+	if ruleKind, ok := telemetry.RuleForSignal(candidateRule.SignalType); ok {
+		normalized.ruleKind = ruleKind
+	}
+	return normalized, nil
 }
 
 func bounded(values map[string]float64) map[string]float64 {

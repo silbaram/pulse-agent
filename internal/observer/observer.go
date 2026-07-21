@@ -150,21 +150,27 @@ func (s *Scheduler) finish(targetID, ruleID string, now time.Time) {
 func (s *Scheduler) observe(ctx context.Context, candidate contract.ServiceTarget, rule contract.ProbeRule, snapshotVersion uint64, now time.Time) (contract.HealthObservation, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, rule.Timeout.Value())
 	defer cancel()
+	startedAt := time.Now()
 	values, err := s.probe.Observe(probeCtx, candidate, rule)
+	probeDuration := time.Since(startedAt)
 	if err != nil {
 		if ctx.Err() != nil {
+			s.recordProbe(ctx, candidate, rule, telemetry.ResultUnavailable, telemetry.ReasonTimeout, probeDuration)
 			return contract.HealthObservation{}, ctx.Err()
 		}
+		s.recordProbe(ctx, candidate, rule, telemetry.ResultUnavailable, telemetry.ReasonUnavailable, probeDuration)
 		return contract.HealthObservation{}, ErrProbeFailed
 	}
 	bounded := boundedValues(values)
 	failed, ok := failedSample(rule, bounded)
 	if !ok {
+		s.recordProbe(ctx, candidate, rule, telemetry.ResultRejected, telemetry.ReasonInvalid, probeDuration)
 		return contract.HealthObservation{}, ErrProbeFailed
 	}
 	state := s.evaluate(candidate.TargetID, rule, now, failed)
 	id, err := s.newID()
 	if err != nil {
+		s.recordProbe(ctx, candidate, rule, telemetry.ResultFailure, telemetry.ReasonInternal, probeDuration)
 		return contract.HealthObservation{}, err
 	}
 	s.mu.Lock()
@@ -177,15 +183,26 @@ func (s *Scheduler) observe(ctx context.Context, candidate contract.ServiceTarge
 		if state == contract.StateUnhealthy {
 			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
 		}
-		event, err := telemetry.NewEvent(telemetry.ComponentObserver, telemetry.OperationRead, result, reason, rule.Timeout.Value())
-		if err != nil {
-			return contract.HealthObservation{}, err
-		}
-		if err := s.telemetry.Record(ctx, event); err != nil {
-			return contract.HealthObservation{}, err
-		}
+		s.recordProbe(ctx, candidate, rule, result, reason, probeDuration)
 	}
 	return observation, nil
+}
+
+func (s *Scheduler) recordProbe(ctx context.Context, candidate contract.ServiceTarget, rule contract.ProbeRule, result telemetry.Result, reason telemetry.Reason, duration time.Duration) {
+	if s.telemetry == nil {
+		return
+	}
+	dimensions := telemetry.Dimensions{}
+	if targetKind, ok := telemetry.TargetForAdapter(candidate.AdapterType); ok {
+		dimensions.Target = targetKind
+	}
+	if ruleKind, ok := telemetry.RuleForSignal(rule.SignalType); ok {
+		dimensions.Rule = ruleKind
+	}
+	event, err := telemetry.NewEventWithDimensions(telemetry.ComponentObserver, telemetry.OperationRead, result, reason, duration, dimensions)
+	if err == nil {
+		s.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 func (s *Scheduler) evaluate(targetID string, rule contract.ProbeRule, now time.Time, failed bool) contract.NormalizedState {
