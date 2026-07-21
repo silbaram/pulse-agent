@@ -2,6 +2,7 @@
 package correlator
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -80,6 +82,8 @@ type Options struct {
 	NewIncidentID func() (string, error)
 	// DedupeWindow groups signals for one target and rule. Zero defaults to five minutes.
 	DedupeWindow time.Duration
+	// Telemetry records bounded incident transition measurements when configured.
+	Telemetry *telemetry.Recorder
 }
 
 // Correlator atomically deduplicates normalized signals and persists lifecycle
@@ -88,6 +92,7 @@ type Correlator struct {
 	state         *store.Store
 	newIncidentID func() (string, error)
 	dedupeWindow  time.Duration
+	telemetry     *telemetry.Recorder
 }
 
 type persistedIncident struct {
@@ -110,12 +115,17 @@ func New(options Options) (*Correlator, error) {
 		state:         options.State,
 		newIncidentID: options.NewIncidentID,
 		dedupeWindow:  dedupeWindow,
+		telemetry:     options.Telemetry,
 	}, nil
 }
 
 // Ingest persists one deterministic candidate, confirmation, recovery, or
 // terminal transition. Replayed input returns Duplicate without mutation.
-func (c *Correlator) Ingest(signal Signal) (Result, error) {
+func (c *Correlator) Ingest(signal Signal) (result Result, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		c.recordTransition(result, resultErr, time.Since(startedAt))
+	}()
 	if c == nil {
 		return Result{}, ErrInvalidOptions
 	}
@@ -124,7 +134,6 @@ func (c *Correlator) Ingest(signal Signal) (Result, error) {
 	}
 	dedupeKey := c.dedupeKey(signal.Observation)
 	inputKey := signalInputKey(signal)
-	var result Result
 	err := c.state.Update(func(tx *store.Tx) error {
 		recordKey := dedupeKey
 		document, found, err := tx.Get(store.BucketIncidents, recordKey)
@@ -163,6 +172,25 @@ func (c *Correlator) Ingest(signal Signal) (Result, error) {
 		return Result{}, err
 	}
 	return result, nil
+}
+
+func (c *Correlator) recordTransition(result Result, ingestErr error, duration time.Duration) {
+	if c == nil || c.telemetry == nil {
+		return
+	}
+	telemetryResult, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if ingestErr != nil {
+		telemetryResult, reason = telemetry.ResultFailure, telemetry.ReasonInternal
+		if errors.Is(ingestErr, ErrInvalidSignal) || errors.Is(ingestErr, ErrInvalidOptions) {
+			telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		}
+	} else if result.Duplicate {
+		telemetryResult, reason = telemetry.ResultRejected, telemetry.ReasonDuplicate
+	}
+	event, err := telemetry.NewEvent(telemetry.ComponentCorrelator, telemetry.OperationTransition, telemetryResult, reason, duration)
+	if err == nil {
+		c.telemetry.RecordBestEffort(context.Background(), event)
+	}
 }
 
 func updateRecord(tx *store.Tx, key string, record persistedIncident, inputKey string, signal Signal) (Result, error) {

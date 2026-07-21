@@ -11,12 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/llm"
+	"pulse-agent/internal/telemetry"
 )
 
 func TestGraph_ContractEvaluationMatchesFakeAndGemini(t *testing.T) {
@@ -114,6 +116,95 @@ func TestGraph_PlaintextSecretNeverReachesModel(t *testing.T) {
 	outcome := newGraph(t, spy).Analyze(context.Background(), input)
 	if outcome.Status != StatusUnavailable || outcome.UnavailableCode != "invalid_input" || spy.calls != 0 {
 		t.Fatalf("Analyze() = %#v, model calls=%d", outcome, spy.calls)
+	}
+}
+
+func TestGraph_RejectsSecretInputWithoutTelemetryLeak(t *testing.T) {
+	golden := analysisJSON(t, contract.AnalysisResult{SchemaVersion: contract.SchemaVersionV1, IncidentID: "incident-1", Hypotheses: []contract.Hypothesis{{Summary: "health check failed", EvidenceRefs: []string{"evidence-1"}}}, EvidenceRefs: []string{"evidence-1"}, ConfidenceLabels: []contract.ConfidenceLabel{contract.ConfidenceHigh}, NotificationRecommendation: contract.NotificationNotify, CandidateRunbookIDs: []string{"restart-web"}})
+	fake, err := llm.NewFake("fake", []llm.FakeEvent{{Response: llmResponse(golden)}})
+	if err != nil {
+		t.Fatalf("NewFake() error = %v", err)
+	}
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	graph, err := NewGraph(Options{Model: fake, Timeout: time.Second, MaxAttempts: 1, MaxEvidenceBytes: 1024, Telemetry: recorder, Provider: telemetry.ProviderGemini})
+	if err != nil {
+		t.Fatalf("NewGraph() error = %v", err)
+	}
+	input := goldenInput()
+	input.Evidence[0].Content = "token=synthetic-secret"
+	input.Evidence[0].Reference.ByteCount = len(input.Evidence[0].Content)
+	if outcome := graph.Analyze(context.Background(), input); outcome.Status != StatusUnavailable || outcome.UnavailableCode != "invalid_input" {
+		t.Fatalf("Analyze(secret input) = %#v, want invalid-input fallback", outcome)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.analysis.analyze" {
+		t.Fatalf("spans = %#v, want one bounded analysis span without a model request", spans)
+	}
+	for _, attribute := range spans[0].Attributes {
+		if attribute.Value.AsString() == "incident-1" || strings.Contains(attribute.Value.AsString(), "synthetic-secret") {
+			t.Fatalf("telemetry leaks incident or secret value %q", attribute.Value.AsString())
+		}
+	}
+}
+
+func TestGraph_RecordsBoundedModelAndAnalysisTelemetry(t *testing.T) {
+	golden := analysisJSON(t, contract.AnalysisResult{SchemaVersion: contract.SchemaVersionV1, IncidentID: "incident-1", Hypotheses: []contract.Hypothesis{{Summary: "health check failed", EvidenceRefs: []string{"evidence-1"}}}, EvidenceRefs: []string{"evidence-1"}, ConfidenceLabels: []contract.ConfidenceLabel{contract.ConfidenceHigh}, NotificationRecommendation: contract.NotificationNotify, CandidateRunbookIDs: []string{"restart-web"}})
+	fake, err := llm.NewFake("fake", []llm.FakeEvent{{Response: llmResponse(golden)}})
+	if err != nil {
+		t.Fatalf("NewFake() error = %v", err)
+	}
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	graph, err := NewGraph(Options{Model: fake, Timeout: time.Second, MaxAttempts: 1, MaxEvidenceBytes: 1024, Telemetry: recorder, Provider: telemetry.ProviderGemini})
+	if err != nil {
+		t.Fatalf("NewGraph() error = %v", err)
+	}
+	if outcome := graph.Analyze(context.Background(), goldenInput()); outcome.Status != StatusComplete {
+		t.Fatalf("Analyze() = %#v, want complete outcome", outcome)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 2 {
+		t.Fatalf("spans = %#v, want model and analysis spans", spans)
+	}
+	for _, span := range spans {
+		if span.Name != "pulse.agent.analysis.request" && span.Name != "pulse.agent.analysis.analyze" {
+			t.Fatalf("span name = %q, want bounded analysis name", span.Name)
+		}
+		providerFound := false
+		for _, attribute := range span.Attributes {
+			if string(attribute.Key) == telemetry.AttributeProvider && attribute.Value.AsString() == "gemini" {
+				providerFound = true
+			}
+			if attribute.Value.AsString() == "incident-1" || strings.Contains(attribute.Value.AsString(), "health=failed") {
+				t.Fatalf("telemetry leaks incident or prompt content %q", attribute.Value.AsString())
+			}
+		}
+		if !providerFound {
+			t.Fatalf("span %q has no bounded provider attribute", span.Name)
+		}
 	}
 }
 

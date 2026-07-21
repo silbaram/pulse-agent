@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/telemetry"
 )
 
 func TestCollectBoundsAndRedactsEvidence(t *testing.T) {
@@ -145,6 +149,37 @@ func TestCollectRedactsPrefixedSecretName(t *testing.T) {
 	}
 	if result.Content != "message=client_secret=[REDACTED]" || strings.Contains(result.Content, "raw-new-secret") {
 		t.Fatalf("Content = %q", result.Content)
+	}
+}
+
+func TestCollect_RecordsRedactionTelemetryWithoutEvidenceContent(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 10, 0, 0, 0, time.UTC)
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	collector := newTestCollector(t, 1, 200, now)
+	collector.telemetry = recorder
+	if _, err := collector.Collect("application-log", "v1", now.Add(-time.Minute), now, []Record{{At: now, Fields: map[string]string{"message": "token=raw-secret"}}}); err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.evidence.redact" {
+		t.Fatalf("spans = %#v, want one evidence redaction span", spans)
+	}
+	for _, attribute := range spans[0].Attributes {
+		if strings.Contains(attribute.Value.AsString(), "raw-secret") || strings.Contains(attribute.Value.AsString(), "application-log") {
+			t.Fatalf("telemetry leaks evidence value %q", attribute.Value.AsString())
+		}
 	}
 }
 

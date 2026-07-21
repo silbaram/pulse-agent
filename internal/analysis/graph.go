@@ -14,6 +14,7 @@ import (
 	"google.golang.org/genai"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/telemetry"
 )
 
 const (
@@ -77,6 +78,10 @@ type Options struct {
 	Timeout          time.Duration
 	MaxAttempts      int
 	MaxEvidenceBytes int
+	// Telemetry records bounded graph and model measurements when configured.
+	Telemetry *telemetry.Recorder
+	// Provider identifies the bounded model-provider classification. Zero defaults to custom.
+	Provider telemetry.Provider
 }
 
 // Graph executes evidence preparation, bounded model analysis, structured validation,
@@ -86,6 +91,8 @@ type Graph struct {
 	timeout          time.Duration
 	maxAttempts      int
 	maxEvidenceBytes int
+	telemetry        *telemetry.Recorder
+	provider         telemetry.Provider
 }
 
 // NewGraph validates graph bounds before accepting untrusted evidence or model output.
@@ -93,11 +100,22 @@ func NewGraph(options Options) (*Graph, error) {
 	if options.Model == nil || options.Timeout < time.Millisecond || options.Timeout > maxTimeout || options.MaxAttempts < 1 || options.MaxAttempts > maxAttempts || options.MaxEvidenceBytes < 1 || options.MaxEvidenceBytes > maxEvidenceBytes {
 		return nil, ErrInvalidOptions
 	}
-	return &Graph{model: options.Model, timeout: options.Timeout, maxAttempts: options.MaxAttempts, maxEvidenceBytes: options.MaxEvidenceBytes}, nil
+	provider := options.Provider
+	if provider == "" {
+		provider = telemetry.ProviderCustom
+	}
+	if _, ok := telemetry.ProviderForName(string(provider)); !ok {
+		return nil, ErrInvalidOptions
+	}
+	return &Graph{model: options.Model, timeout: options.Timeout, maxAttempts: options.MaxAttempts, maxEvidenceBytes: options.MaxEvidenceBytes, telemetry: options.Telemetry, provider: provider}, nil
 }
 
 // Analyze runs every graph node with bounded input and returns an explicit safe fallback on model failure.
-func (g *Graph) Analyze(ctx context.Context, input Input) Outcome {
+func (g *Graph) Analyze(ctx context.Context, input Input) (outcome Outcome) {
+	startedAt := time.Now()
+	defer func() {
+		g.recordAnalysis(ctx, outcome, time.Since(startedAt))
+	}()
 	if g == nil || ctx == nil {
 		return unavailable("invalid_input")
 	}
@@ -112,8 +130,11 @@ func (g *Graph) Analyze(ctx context.Context, input Input) Outcome {
 	invalidResult := false
 	for attempt := 0; attempt < g.maxAttempts; attempt++ {
 		callContext, cancel := context.WithTimeout(ctx, g.timeout)
+		modelStartedAt := time.Now()
 		response, err := g.generate(callContext, prompt)
+		callErr := callContext.Err()
 		cancel()
+		g.recordModel(ctx, err, callErr, time.Since(modelStartedAt))
 		if err != nil {
 			continue
 		}
@@ -128,6 +149,40 @@ func (g *Graph) Analyze(ctx context.Context, input Input) Outcome {
 		return unavailable("invalid_result")
 	}
 	return unavailable("model_unavailable")
+}
+
+func (g *Graph) recordAnalysis(ctx context.Context, outcome Outcome, duration time.Duration) {
+	if g == nil || g.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if outcome.Status != StatusComplete {
+		result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		if outcome.UnavailableCode == "invalid_input" || outcome.UnavailableCode == "invalid_result" {
+			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
+		}
+	}
+	event, err := telemetry.NewEventWithDimensions(telemetry.ComponentAnalysis, telemetry.OperationAnalyze, result, reason, duration, telemetry.Dimensions{Provider: g.provider})
+	if err == nil {
+		g.telemetry.RecordBestEffort(ctx, event)
+	}
+}
+
+func (g *Graph) recordModel(ctx context.Context, generateErr, contextErr error, duration time.Duration) {
+	if g == nil || g.telemetry == nil {
+		return
+	}
+	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
+	if generateErr != nil {
+		result, reason = telemetry.ResultUnavailable, telemetry.ReasonUnavailable
+		if errors.Is(contextErr, context.DeadlineExceeded) {
+			reason = telemetry.ReasonTimeout
+		}
+	}
+	event, err := telemetry.NewEventWithDimensions(telemetry.ComponentAnalysis, telemetry.OperationRequest, result, reason, duration, telemetry.Dimensions{Provider: g.provider})
+	if err == nil {
+		g.telemetry.RecordBestEffort(ctx, event)
+	}
 }
 
 type preparedInput struct {

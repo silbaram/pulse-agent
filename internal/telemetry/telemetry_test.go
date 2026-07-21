@@ -159,6 +159,49 @@ func TestNewEvent_RejectsSensitiveOrUnboundedValues(t *testing.T) {
 	}
 }
 
+func TestNewEventWithDimensions_ExportsOnlyBoundedSemanticAttributes(t *testing.T) {
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := New(Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	event, err := NewEventWithDimensions(ComponentAnalysis, OperationAnalyze, ResultSuccess, ReasonAccepted, time.Millisecond, Dimensions{Target: TargetDocker, Rule: RuleAvailability, Provider: ProviderGemini})
+	if err != nil {
+		t.Fatalf("NewEventWithDimensions() error = %v", err)
+	}
+	recorder.RecordBestEffort(context.Background(), event)
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	attributes := attributesByKey(spans[0].Attributes)
+	for key, want := range map[string]string{AttributeTarget: string(TargetDocker), AttributeRule: string(RuleAvailability), AttributeProvider: string(ProviderGemini)} {
+		if got := attributes[key]; got != want {
+			t.Errorf("attribute %q = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestNewEventWithDimensions_RejectsHighCardinalityValues(t *testing.T) {
+	for _, dimensions := range []Dimensions{
+		{Target: Target("checkout-production")},
+		{Rule: Rule("customer-rule")},
+		{Provider: Provider("https://provider.example")},
+	} {
+		if _, err := NewEventWithDimensions(ComponentObserver, OperationRead, ResultSuccess, ReasonNone, 0, dimensions); !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("NewEventWithDimensions(%#v) error = %v, want %v", dimensions, err, ErrInvalidEvent)
+		}
+	}
+}
+
 func attributesByKey(values []attribute.KeyValue) map[string]string {
 	attributes := make(map[string]string, len(values))
 	for _, value := range values {

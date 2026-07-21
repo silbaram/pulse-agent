@@ -2,14 +2,18 @@ package correlator
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/store"
+	"pulse-agent/internal/telemetry"
 )
 
 func TestCorrelator_IngestMergesDirectAndExternalSignalsInEitherOrder(t *testing.T) {
@@ -210,6 +214,36 @@ func TestCorrelator_IngestDoesNotPersistRawExternalIdentity(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("State.View() error = %v", err)
+	}
+}
+
+func TestCorrelator_IngestRecordsBoundedTransitionTelemetry(t *testing.T) {
+	spanExporter := tracetest.NewInMemoryExporter()
+	recorder, err := telemetry.New(telemetry.Options{SpanExporter: spanExporter})
+	if err != nil {
+		t.Fatalf("telemetry.New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if shutdownErr := recorder.Shutdown(context.Background()); shutdownErr != nil {
+			t.Errorf("Shutdown() error = %v", shutdownErr)
+		}
+	})
+	correlator, _ := newTestCorrelator(t)
+	correlator.telemetry = recorder
+	if _, err := correlator.Ingest(testSignal("observation-secret", "monitor-token-value", "external-secret", contract.StateUnhealthy, time.Now())); err != nil {
+		t.Fatalf("Ingest() error = %v", err)
+	}
+	if err := recorder.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush() error = %v", err)
+	}
+	spans := spanExporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "pulse.agent.correlator.transition" {
+		t.Fatalf("spans = %#v, want one incident transition span", spans)
+	}
+	for _, attribute := range spans[0].Attributes {
+		if attribute.Value.AsString() == "monitor-token-value" || attribute.Value.AsString() == "external-secret" || attribute.Value.AsString() == "incident-1" {
+			t.Fatalf("telemetry leaks sensitive or high-cardinality value %q", attribute.Value.AsString())
+		}
 	}
 }
 
