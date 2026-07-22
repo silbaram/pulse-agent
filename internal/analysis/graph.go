@@ -244,7 +244,7 @@ func (g *Graph) buildPrompt(input preparedInput) (string, error) {
 		payload.Evidence = append(payload.Evidence, evidencePrompt{EvidenceID: item.Reference.EvidenceID, Content: item.Content})
 	}
 	for _, item := range input.runbooks {
-		payload.Runbooks = append(payload.Runbooks, runbookPrompt{RunbookID: item.RunbookID, Description: item.Description})
+		payload.Runbooks = append(payload.Runbooks, runbookPrompt(item))
 	}
 	document, err := json.Marshal(payload)
 	if err != nil || len(document) > contract.MaxDocumentBytes {

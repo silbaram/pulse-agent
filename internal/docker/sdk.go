@@ -10,7 +10,7 @@ import (
 
 // NewSDKClient creates the production Docker Engine client with API negotiation enabled.
 func NewSDKClient() (Client, error) {
-	apiClient, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
+	apiClient, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, err
 	}

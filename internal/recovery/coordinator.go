@@ -384,7 +384,7 @@ func (c *Coordinator) prepare(ctx context.Context, request Request, now time.Tim
 }
 
 func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result, error) {
-	decision, now, expired, err := c.revalidate(ctx, record)
+	decision, _, expired, err := c.revalidate(ctx, record)
 	if err != nil {
 		return c.denyAfterRevalidation(record, decision, err)
 	}
@@ -402,7 +402,7 @@ func (c *Coordinator) execute(ctx context.Context, record journalRecord) (Result
 		return c.denyAfterRevalidation(record, decision, fmt.Errorf("validate recovery action: %w", err))
 	}
 
-	decision, now, expired, err = c.revalidate(ctx, record)
+	decision, now, expired, err := c.revalidate(ctx, record)
 	if err != nil {
 		return c.denyAfterRevalidation(record, decision, err)
 	}
