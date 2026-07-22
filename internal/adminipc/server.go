@@ -36,6 +36,8 @@ const (
 	errorIncidentNotFound    = "incident_not_found"
 	auditReasonUnsupported   = "unsupported_operation"
 	statusCapabilityAdminIPC = "admin_ipc"
+	statusWarningDocker      = "docker_socket_high_privilege"
+	statusUnsupportedCommand = "raw_host_command"
 	statusUnsupportedHost    = "host_power_os_network_outage"
 )
 
@@ -396,7 +398,8 @@ func (s *Server) route(connection io.Writer, actor Actor, request Request) error
 				SchemaVersion: SchemaVersion,
 				State:         StatusRunning,
 				Capabilities:  s.capabilities(),
-				Unsupported:   []string{statusUnsupportedHost},
+				Warnings:      []string{statusWarningDocker},
+				Unsupported:   []string{statusUnsupportedCommand, statusUnsupportedHost},
 			},
 		})
 	case OperationBackup:

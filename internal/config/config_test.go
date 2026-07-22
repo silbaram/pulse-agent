@@ -24,6 +24,16 @@ func TestLoad_ValidFixtures(t *testing.T) {
 	}
 }
 
+func TestLoad_PackagingExample(t *testing.T) {
+	value, err := Load(filepath.Join("..", "..", "packaging", "examples", "config.json"))
+	if err != nil {
+		t.Fatalf("Load() packaging example error = %v", err)
+	}
+	if value.UsageMode != UsageProduction || value.Webhooks.Ingress.PreviousSecretRef == "" || value.Webhooks.Outbound.PreviousSecretRef == "" {
+		t.Fatalf("packaging config = %#v, want production config with rotation references", value)
+	}
+}
+
 func TestLoad_RejectsInvalidFixtures(t *testing.T) {
 	tests := []struct {
 		name string
@@ -91,6 +101,49 @@ func TestConfig_ValidateRejectsMissingOrDuplicateAdminIdentities(t *testing.T) {
 			name: "target ID traversal",
 			mutate: func(value *Config) {
 				value.AllowedTargets[0].TargetID = "../escape"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value := valid
+			tt.mutate(&value)
+			if err := value.Validate(); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("Validate() error = %v, want %v", err, ErrInvalidConfig)
+			}
+		})
+	}
+}
+
+func TestConfig_ValidateWebhookSecretRotationReferences(t *testing.T) {
+	document, err := os.ReadFile(filepath.Join("testdata", "valid-production.json"))
+	if err != nil {
+		t.Fatalf("read valid fixture: %v", err)
+	}
+	valid, err := Decode(document)
+	if err != nil {
+		t.Fatalf("Decode() valid fixture error = %v", err)
+	}
+	valid.Webhooks.Ingress.PreviousSecretRef = "env:PULSE_AGENT_INGRESS_SECRET_PREVIOUS"
+	valid.Webhooks.Outbound.PreviousSecretRef = "env:PULSE_AGENT_OUTBOUND_SECRET_PREVIOUS"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() rotation references error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "plain previous secret",
+			mutate: func(value *Config) {
+				value.Webhooks.Ingress.PreviousSecretRef = "plain-secret"
+			},
+		},
+		{
+			name: "previous duplicates current",
+			mutate: func(value *Config) {
+				value.Webhooks.Outbound.PreviousSecretRef = value.Webhooks.Outbound.SecretRef
 			},
 		},
 	}

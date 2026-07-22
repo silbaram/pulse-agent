@@ -1,0 +1,28 @@
+{
+  "schema_version": "v1",
+  "runbook_id": "restart-checkout",
+  "version": "1",
+  "adapter_type": "docker",
+  "target_constraints": [],
+  "typed_actions": [
+    {
+      "action_type": "docker.container.restart",
+      "target_selector": "container:checkout",
+      "stop_timeout": "5s",
+      "cooldown": "0s"
+    }
+  ],
+  "risk_tier": "low",
+  "auto_execute": false,
+  "approval_policy": {
+    "required": true
+  },
+  "preconditions": [],
+  "retry_policy": {
+    "max_attempts": 1
+  },
+  "stabilization_policy": {
+    "recovery_samples": 2,
+    "window": "1m"
+  }
+}

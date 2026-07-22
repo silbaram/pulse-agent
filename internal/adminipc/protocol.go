@@ -142,6 +142,8 @@ type Status struct {
 	State StatusState `json:"state"`
 	// Capabilities lists enabled bounded administrative capabilities.
 	Capabilities []string `json:"capabilities"`
+	// Warnings lists stable operator-facing security warnings.
+	Warnings []string `json:"warnings"`
 	// Unsupported lists explicit standalone limitations.
 	Unsupported []string `json:"unsupported"`
 }
@@ -299,6 +301,11 @@ func (s Status) valid() bool {
 	}
 	for _, capability := range s.Capabilities {
 		if !validCode(capability, maxReasonCodeBytes) {
+			return false
+		}
+	}
+	for _, warning := range s.Warnings {
+		if !validCode(warning, maxReasonCodeBytes) {
 			return false
 		}
 	}

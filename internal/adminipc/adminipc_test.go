@@ -168,6 +168,18 @@ func TestServer_StatusAndBackupAuditAuthenticatedActor(t *testing.T) {
 	if len(status.Capabilities) != 1 || status.Capabilities[0] != statusCapabilityAdminIPC {
 		t.Errorf("status capabilities = %#v, want admin IPC capability", status.Capabilities)
 	}
+	if len(status.Warnings) != 1 || status.Warnings[0] != statusWarningDocker {
+		t.Errorf("status warnings = %#v, want Docker socket privilege warning", status.Warnings)
+	}
+	wantUnsupported := []string{statusUnsupportedCommand, statusUnsupportedHost}
+	if len(status.Unsupported) != len(wantUnsupported) {
+		t.Fatalf("status unsupported = %#v, want %#v", status.Unsupported, wantUnsupported)
+	}
+	for index, want := range wantUnsupported {
+		if status.Unsupported[index] != want {
+			t.Errorf("status unsupported[%d] = %q, want %q", index, status.Unsupported[index], want)
+		}
+	}
 
 	var snapshot bytes.Buffer
 	if err := client.Backup(context.Background(), socketPath, "routine_backup", &snapshot); err != nil {

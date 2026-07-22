@@ -1,0 +1,46 @@
+{
+  "schema_version": "v1",
+  "usage_mode": "production",
+  "data_directory": "/var/lib/pulse-agent",
+  "evidence_directory": "/var/lib/pulse-agent/evidence",
+  "docker": {
+    "endpoint": "unix:///var/run/docker.sock"
+  },
+  "admin": {
+    "socket_path": "/var/lib/pulse-agent/admin.sock",
+    "allowed_uids": [0],
+    "allowed_gids": [0]
+  },
+  "limits": {
+    "max_targets": 50,
+    "retention": {
+      "max_age": "168h",
+      "max_bytes": 1073741824
+    }
+  },
+  "allowed_targets": [
+    {
+      "target_id": "checkout",
+      "adapter_type": "docker"
+    }
+  ],
+  "gemini": {
+    "provider": "gemini",
+    "model": "gemini-2.5-flash",
+    "timeout": "30s",
+    "data_processing_mode": "billing_enabled",
+    "api_key_ref": "env:PULSE_AGENT_GEMINI_API_KEY"
+  },
+  "webhooks": {
+    "ingress": {
+      "endpoint": "https://alerts.example.com/pulse-agent",
+      "secret_ref": "env:PULSE_AGENT_INGRESS_SECRET",
+      "previous_secret_ref": "env:PULSE_AGENT_INGRESS_SECRET_PREVIOUS"
+    },
+    "outbound": {
+      "endpoint": "https://notify.example.com/pulse-agent",
+      "secret_ref": "env:PULSE_AGENT_OUTBOUND_SECRET",
+      "previous_secret_ref": "env:PULSE_AGENT_OUTBOUND_SECRET_PREVIOUS"
+    }
+  }
+}

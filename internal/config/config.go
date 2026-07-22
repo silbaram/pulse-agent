@@ -122,8 +122,9 @@ type WebhooksConfig struct {
 
 // WebhookConfig identifies one webhook endpoint and signing secret reference.
 type WebhookConfig struct {
-	Endpoint  string          `json:"endpoint"`
-	SecretRef SecretReference `json:"secret_ref"`
+	Endpoint          string          `json:"endpoint"`
+	SecretRef         SecretReference `json:"secret_ref"`
+	PreviousSecretRef SecretReference `json:"previous_secret_ref,omitempty"`
 }
 
 // Load reads one configuration file and applies the same validation used before
@@ -293,13 +294,20 @@ func (c GeminiConfig) validate(usageMode UsageMode) error {
 }
 
 func (c WebhooksConfig) validate(usageMode UsageMode) error {
-	if !isWebhookEndpoint(c.Ingress.Endpoint, usageMode) || !isSecretReference(c.Ingress.SecretRef) {
+	if !isWebhookEndpoint(c.Ingress.Endpoint, usageMode) || !validWebhookSecrets(c.Ingress) {
 		return ErrInvalidConfig
 	}
-	if !isWebhookEndpoint(c.Outbound.Endpoint, usageMode) || !isSecretReference(c.Outbound.SecretRef) {
+	if !isWebhookEndpoint(c.Outbound.Endpoint, usageMode) || !validWebhookSecrets(c.Outbound) {
 		return ErrInvalidConfig
 	}
 	return nil
+}
+
+func validWebhookSecrets(value WebhookConfig) bool {
+	if !isSecretReference(value.SecretRef) {
+		return false
+	}
+	return value.PreviousSecretRef == "" || value.PreviousSecretRef != value.SecretRef && isSecretReference(value.PreviousSecretRef)
 }
 
 func isSecretReference(value SecretReference) bool {

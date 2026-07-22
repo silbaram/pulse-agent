@@ -321,7 +321,8 @@ func TestExecute_StatusRoutesThroughDaemonClient(t *testing.T) {
 				SchemaVersion: adminipc.SchemaVersion,
 				State:         adminipc.StatusRunning,
 				Capabilities:  []string{"admin_ipc"},
-				Unsupported:   []string{"host_power_os_network_outage"},
+				Warnings:      []string{"docker_socket_high_privilege"},
+				Unsupported:   []string{"raw_host_command", "host_power_os_network_outage"},
 			}, nil
 		}},
 	)
@@ -345,6 +346,12 @@ func TestExecute_StatusRoutesThroughDaemonClient(t *testing.T) {
 	}
 	if status.State != adminipc.StatusRunning {
 		t.Errorf("status state = %q, want %q", status.State, adminipc.StatusRunning)
+	}
+	if len(status.Warnings) != 1 || status.Warnings[0] != "docker_socket_high_privilege" {
+		t.Errorf("status warnings = %#v, want Docker socket warning", status.Warnings)
+	}
+	if len(status.Unsupported) != 2 || status.Unsupported[0] != "raw_host_command" || status.Unsupported[1] != "host_power_os_network_outage" {
+		t.Errorf("status unsupported = %#v, want standalone limitations", status.Unsupported)
 	}
 }
 

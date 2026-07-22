@@ -1,0 +1,28 @@
+{
+  "schema_version": "v1",
+  "target_id": "checkout",
+  "adapter_type": "docker",
+  "selector": "container:checkout",
+  "probe_rules": [
+    {
+      "rule_id": "availability",
+      "signal_type": "availability",
+      "interval": "1m",
+      "timeout": "1s",
+      "threshold": 1,
+      "consecutive_failures": 3,
+      "recovery_samples": 2,
+      "slo_window": "5m",
+      "severity": "critical"
+    }
+  ],
+  "evidence_policy": {
+    "redaction_profile": "strict",
+    "max_bytes": 1048576
+  },
+  "stabilization_policy": {
+    "recovery_samples": 2,
+    "window": "1m"
+  },
+  "enabled": true
+}
