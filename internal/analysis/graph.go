@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,15 +13,15 @@ import (
 	"google.golang.org/genai"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/redaction"
 	"pulse-agent/internal/telemetry"
 )
 
 const (
-	maxEvidenceBytes        = 64 * 1024
-	maxRunbooks             = 64
-	maxAttempts             = 2
-	maxTimeout              = 2 * time.Minute
-	secretPatternExpression = `(?i)\b(?:api[_-]?key|token|password|secret|authorization)\b\s*(?:(?:[:=]\s*(?:bearer\s+)?)|(?:bearer\s+))([^\s,;]+)`
+	maxEvidenceBytes = 64 * 1024
+	maxRunbooks      = 64
+	maxAttempts      = 2
+	maxTimeout       = 2 * time.Minute
 )
 
 var (
@@ -191,7 +190,7 @@ type preparedInput struct {
 }
 
 func (g *Graph) prepareEvidence(input Input) (preparedInput, error) {
-	if g == nil || input.IncidentID == "" || len(input.Evidence) == 0 || len(input.Evidence) > maxRunbooks || len(input.Runbooks) > maxRunbooks {
+	if g == nil || !validIdentifier(input.IncidentID) || len(input.Evidence) == 0 || len(input.Evidence) > maxRunbooks || len(input.Runbooks) > maxRunbooks {
 		return preparedInput{}, ErrInvalidInput
 	}
 	totalBytes := 0
@@ -211,7 +210,7 @@ func (g *Graph) prepareEvidence(input Input) (preparedInput, error) {
 	registered := make(map[string]struct{}, len(input.Runbooks))
 	preparedRunbooks := make([]RunbookDescription, 0, len(input.Runbooks))
 	for _, item := range input.Runbooks {
-		if !validIdentifier(item.RunbookID) || item.Description == "" || !utf8.ValidString(item.Description) || len(item.Description) > contract.MaxDocumentBytes {
+		if !validIdentifier(item.RunbookID) || item.Description == "" || !utf8.ValidString(item.Description) || len(item.Description) > contract.MaxDocumentBytes || redaction.ContainsSensitive(item.Description) {
 			return preparedInput{}, ErrInvalidInput
 		}
 		if _, duplicate := registered[item.RunbookID]; duplicate {
@@ -224,12 +223,7 @@ func (g *Graph) prepareEvidence(input Input) (preparedInput, error) {
 }
 
 func containsUnredactedSecret(content string) bool {
-	for _, match := range regexp.MustCompile(secretPatternExpression).FindAllStringSubmatch(content, -1) {
-		if len(match) != 2 || match[1] != "[REDACTED]" {
-			return true
-		}
-	}
-	return false
+	return redaction.ContainsSensitive(content)
 }
 
 func (g *Graph) buildPrompt(input preparedInput) (string, error) {
@@ -326,7 +320,7 @@ func validEvidence(item Evidence) bool {
 }
 
 func validIdentifier(value string) bool {
-	return value != "" && len(value) <= 128 && !strings.Contains(value, "..")
+	return value != "" && len(value) <= 128 && !strings.Contains(value, "..") && !redaction.ContainsSensitive(value)
 }
 
 func knownReferences(values []string, allowed map[string]struct{}) bool {

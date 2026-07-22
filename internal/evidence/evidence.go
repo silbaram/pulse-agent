@@ -6,13 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/redaction"
 	"pulse-agent/internal/telemetry"
 )
 
@@ -21,13 +20,6 @@ var (
 	ErrInvalidOptions = errors.New("invalid evidence collector options")
 	// ErrRedactionFailed indicates that untrusted input could not be safely redacted.
 	ErrRedactionFailed = errors.New("evidence redaction failed")
-
-	sensitiveLabel      = `(?:[a-z0-9_-]*?(?:api[_-]?key|token|password|secret|credential|private[_-]?key)|customer[_-]?(?:id|name|email|phone))`
-	secretValuePattern  = regexp.MustCompile(`(?i)\b(` + sensitiveLabel + `)\b\s*([:=])\s*([^\s,;]+)`)
-	secretMarkerPattern = regexp.MustCompile(`(?i)\b` + sensitiveLabel + `\b\s*[:=]\s*(?:$|[,;])`)
-	bearerPattern       = regexp.MustCompile(`(?i)\bauthorization\s*:\s*bearer\s+\S+`)
-	emailPattern        = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
-	phonePattern        = regexp.MustCompile(`\b(?:\+?\d{1,3}[ -]?)?(?:\d{2,4}[ -]?)?\d{3,4}[ -]\d{4}\b`)
 )
 
 // Record is one local collector record before redaction.
@@ -98,7 +90,7 @@ func (c *Collector) Collect(source, profile string, start, end time.Time, record
 	defer func() {
 		c.recordRedaction(resultErr, time.Since(startedAt))
 	}()
-	if c == nil || source == "" || profile == "" || start.IsZero() || end.IsZero() || end.Before(start) {
+	if c == nil || source == "" || profile == "" || redaction.ContainsSensitive(source) || redaction.ContainsSensitive(profile) || start.IsZero() || end.IsZero() || end.Before(start) {
 		return Result{}, ErrInvalidOptions
 	}
 
@@ -134,7 +126,7 @@ func (c *Collector) Collect(source, profile string, start, end time.Time, record
 
 	content := strings.Join(lines, "\n")
 	id, err := c.newID()
-	if err != nil || id == "" {
+	if err != nil || id == "" || redaction.ContainsSensitive(id) {
 		return Result{}, ErrInvalidOptions
 	}
 	now := c.clock()
@@ -167,7 +159,9 @@ func (c *Collector) recordRedaction(collectErr error, duration time.Duration) {
 	result, reason := telemetry.ResultSuccess, telemetry.ReasonAccepted
 	if collectErr != nil {
 		result, reason = telemetry.ResultFailure, telemetry.ReasonInternal
-		if errors.Is(collectErr, ErrRedactionFailed) || errors.Is(collectErr, ErrInvalidOptions) {
+		if errors.Is(collectErr, ErrRedactionFailed) {
+			result, reason = telemetry.ResultRejected, telemetry.ReasonRedactionFailed
+		} else if errors.Is(collectErr, ErrInvalidOptions) {
 			result, reason = telemetry.ResultRejected, telemetry.ReasonInvalid
 		}
 	}
@@ -195,13 +189,5 @@ func (c *Collector) redactRecord(fields map[string]string) (string, bool) {
 }
 
 func redact(value string) (string, bool) {
-	if !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 || secretMarkerPattern.MatchString(value) {
-		return "", false
-	}
-
-	redacted := secretValuePattern.ReplaceAllString(value, "${1}${2}[REDACTED]")
-	redacted = bearerPattern.ReplaceAllString(redacted, "Authorization: Bearer [REDACTED]")
-	redacted = emailPattern.ReplaceAllString(redacted, "[REDACTED_EMAIL]")
-	redacted = phonePattern.ReplaceAllString(redacted, "[REDACTED_PHONE]")
-	return redacted, true
+	return redaction.Redact(value)
 }

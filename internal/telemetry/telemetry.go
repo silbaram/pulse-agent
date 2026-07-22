@@ -161,6 +161,8 @@ const (
 	ReasonDuplicate Reason = "duplicate"
 	// ReasonInvalid identifies rejected malformed or unsafe input.
 	ReasonInvalid Reason = "invalid"
+	// ReasonRedactionFailed identifies evidence blocked because redaction could not prove it safe.
+	ReasonRedactionFailed Reason = "redaction_failed"
 	// ReasonUnauthorized identifies an authentication or authorization rejection.
 	ReasonUnauthorized Reason = "unauthorized"
 	// ReasonTimeout identifies a bounded timeout.
@@ -494,7 +496,7 @@ func validResult(value Result) bool {
 
 func validReason(value Reason) bool {
 	switch value {
-	case ReasonNone, ReasonAccepted, ReasonDuplicate, ReasonInvalid, ReasonUnauthorized, ReasonTimeout, ReasonUnavailable, ReasonInternal, ReasonAllowed, ReasonDenied, ReasonApprovalRequired, ReasonConflict, ReasonExpired, ReasonRetry, ReasonUnhealthy, ReasonPayload:
+	case ReasonNone, ReasonAccepted, ReasonDuplicate, ReasonInvalid, ReasonRedactionFailed, ReasonUnauthorized, ReasonTimeout, ReasonUnavailable, ReasonInternal, ReasonAllowed, ReasonDenied, ReasonApprovalRequired, ReasonConflict, ReasonExpired, ReasonRetry, ReasonUnhealthy, ReasonPayload:
 		return true
 	default:
 		return false

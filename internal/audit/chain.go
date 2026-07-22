@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"pulse-agent/internal/contract"
+	"pulse-agent/internal/redaction"
 	"pulse-agent/internal/store"
 )
 
@@ -28,17 +29,6 @@ var (
 	// ErrChainCapacity indicates that the ordered audit key space is exhausted.
 	ErrChainCapacity = errors.New("audit chain capacity exhausted")
 )
-
-var sensitivePrefixes = []string{
-	"whsec_",
-	"sk-",
-	"ghp_",
-	"github_pat_",
-	"xoxb-",
-	"xoxp-",
-	"akia",
-	"aiza",
-}
 
 // Mutation applies an aggregate state change in the same transaction as an
 // audit append. It must not modify store.BucketAudit directly.
@@ -234,7 +224,7 @@ func validAuditField(value string) bool {
 	if value == "" || len(value) > maxFieldBytes {
 		return false
 	}
-	if containsSensitiveValue(strings.ToLower(value)) {
+	if redaction.ContainsSensitive(value) {
 		return false
 	}
 	for _, character := range value {
@@ -248,35 +238,6 @@ func validAuditField(value string) bool {
 		}
 	}
 	return true
-}
-
-func containsSensitiveValue(value string) bool {
-	for _, prefix := range sensitivePrefixes {
-		if containsTokenPrefix(value, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsTokenPrefix(value, prefix string) bool {
-	for offset := 0; ; {
-		index := strings.Index(value[offset:], prefix)
-		if index < 0 {
-			return false
-		}
-		index += offset
-		if index == 0 || !isASCIIAlphaNumeric(value[index-1]) {
-			return true
-		}
-		offset = index + len(prefix)
-	}
-}
-
-func isASCIIAlphaNumeric(character byte) bool {
-	return character >= 'a' && character <= 'z' ||
-		character >= 'A' && character <= 'Z' ||
-		character >= '0' && character <= '9'
 }
 
 func validDigest(value string) bool {

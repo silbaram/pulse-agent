@@ -16,6 +16,7 @@ import (
 
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/delivery"
+	"pulse-agent/internal/redaction"
 	"pulse-agent/internal/store"
 )
 
@@ -342,11 +343,11 @@ func recordKey(eventID string) string {
 }
 
 func validIdentifier(value string, limit int) bool {
-	return value != "" && len(value) <= limit && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+	return value != "" && len(value) <= limit && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00') && !redaction.ContainsSensitive(value)
 }
 
 func validReasonCode(value string) bool {
-	if value == "" || len(value) > maxReasonCodeLength {
+	if value == "" || len(value) > maxReasonCodeLength || redaction.ContainsSensitive(value) {
 		return false
 	}
 	for _, character := range value {

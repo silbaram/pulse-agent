@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"pulse-agent/internal/contract"
 	"pulse-agent/internal/delivery"
 	"pulse-agent/internal/lifecycle"
+	"pulse-agent/internal/redaction"
 	"pulse-agent/internal/store"
 	"pulse-agent/internal/telemetry"
 )
@@ -30,8 +30,6 @@ const (
 	maxPostmortemTextLength = 4096
 	reportRecordPrefix      = "report/"
 )
-
-var secretPattern = regexp.MustCompile(`(?i)\b(?:api[_-]?key|token|password|secret|authorization)\b\s*(?:[:=]|bearer\s+)\s*[^\s,;]+`)
 
 // Clock supplies deterministic report timestamps.
 type Clock interface {
@@ -347,7 +345,7 @@ func validReportContent(report contract.IncidentReport) bool {
 }
 
 func validIdentifier(value string, limit int) bool {
-	return value != "" && len(value) <= limit && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00')
+	return value != "" && len(value) <= limit && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00') && !redaction.ContainsSensitive(value)
 }
 
 func validEvidenceRefs(references []string) bool {
@@ -429,7 +427,7 @@ func safeShortText(value string) bool {
 }
 
 func safeText(value string, limit int) bool {
-	return value != "" && len(value) <= limit && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00') && !secretPattern.MatchString(value)
+	return value != "" && len(value) <= limit && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsRune(value, '\x00') && !redaction.ContainsSensitive(value)
 }
 
 func cloneHypotheses(values []contract.Hypothesis) []contract.Hypothesis {
