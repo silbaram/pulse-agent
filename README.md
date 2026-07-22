@@ -18,3 +18,7 @@ make reproducible-linux
 systemd service, 전용 system account, 디렉터리 권한, 설정 예제는 [`packaging/`](packaging/)에 있다. 설치, 검증, target/runbook 등록, approval, status, backup/restore, upgrade와 제거 절차는 [`docs/operations.md`](docs/operations.md)를 따른다.
 
 Docker socket 접근은 host root에 준하는 높은 로컬 권한이다. 서비스 계정과 바이너리, 설정 파일을 일반 애플리케이션 계정과 분리하고 관리 IPC를 최소 인원에게만 허용해야 한다.
+
+## MVP acceptance baseline
+
+통제된 fixture에서 MVP 수치 기준과 Go 품질 게이트를 재현하려면 [`docs/acceptance.md`](docs/acceptance.md)를 따른다. 생성되는 결과는 production SLO가 아니라 고정 seed와 fixture version에 대한 MVP acceptance baseline이다.

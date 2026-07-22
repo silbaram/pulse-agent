@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"pulse-agent/internal/acceptance"
 	"pulse-agent/internal/adminipc"
 	"pulse-agent/internal/config"
 	"pulse-agent/internal/contract"
@@ -117,6 +119,9 @@ func executeWithProductionClient(
 	service standaloneRunner,
 	loadConfig configLoader,
 ) int {
+	if len(args) > 0 && args[0] == "acceptance" {
+		return executeAcceptance(ctx, args, stdout, stderr)
+	}
 	client, err := adminipc.NewProductionClient()
 	if err != nil {
 		return writeError(stderr, ExitFailure, "admin_client_unavailable", "", "administrative client initialization failed")
@@ -150,6 +155,9 @@ func executeWithDependencies(
 	if args[0] == "config" {
 		return executeConfig(args, stdout, stderr, loadConfig)
 	}
+	if args[0] == "acceptance" {
+		return executeAcceptance(ctx, args, stdout, stderr)
+	}
 
 	if _, ok := directCommands[args[0]]; ok {
 		return executeAdmin(ctx, args, stdout, stderr, loadConfig, client)
@@ -172,6 +180,46 @@ func executeWithDependencies(
 	}
 
 	return writeError(stderr, ExitUsage, "unknown_command", args[0], "unknown command")
+}
+
+func executeAcceptance(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	const commandName = "acceptance run"
+	if (len(args) == 2 && isHelp(args[1])) || (len(args) == 3 && isHelp(args[2])) {
+		fmt.Fprintln(stdout, "Usage: pulse-agent acceptance run --output <directory> [--go-bin <path>]")
+		return ExitSuccess
+	}
+	if len(args) < 4 || args[1] != "run" || len(args)%2 != 0 {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "acceptance run requires --output <directory> with optional --go-bin <path>")
+	}
+	var outputDirectory, goBinary string
+	for index := 2; index < len(args); index += 2 {
+		if args[index+1] == "" {
+			return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "acceptance option values must not be empty")
+		}
+		switch args[index] {
+		case "--output":
+			outputDirectory = args[index+1]
+		case "--go-bin":
+			goBinary = args[index+1]
+		default:
+			return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "unknown acceptance option")
+		}
+	}
+	if outputDirectory == "" {
+		return writeError(stderr, ExitUsage, "invalid_arguments", commandName, "acceptance run requires --output <directory>")
+	}
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return writeError(stderr, ExitFailure, "working_directory_unavailable", commandName, "working directory is unavailable")
+	}
+	result, err := acceptance.Run(ctx, acceptance.Options{OutputDir: outputDirectory, ProjectRoot: projectRoot, GoBinary: goBinary})
+	if err != nil {
+		if result.JSONPath != "" {
+			_ = writeJSON(stdout, result)
+		}
+		return writeError(stderr, ExitFailure, "acceptance_failed", commandName, "acceptance baseline did not pass")
+	}
+	return writeJSON(stdout, result)
 }
 
 func executeApproval(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfig configLoader, client adminClient) int {
@@ -623,6 +671,7 @@ Commands:
   approval deny       Deny an approval through the local daemon
   status              Show standalone daemon status
   backup              Request a daemon-owned state backup
+  acceptance run      Generate the deterministic MVP acceptance baseline
 
 Use "pulse-agent <command> --help" for command usage.
 `)

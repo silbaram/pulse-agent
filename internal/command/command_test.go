@@ -113,11 +113,43 @@ func TestExecute_HelpExposesApprovedCommands(t *testing.T) {
 		"approval deny",
 		"status",
 		"backup",
+		"acceptance run",
 	}
 	for _, commandName := range wantCommands {
 		if !strings.Contains(stdout.String(), commandName) {
 			t.Errorf("help output does not contain %q", commandName)
 		}
+	}
+}
+
+func TestExecute_AcceptanceHelpAndUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := executeWithDependencies(
+		context.Background(),
+		[]string{"acceptance", "run", "--help"},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { return nil }),
+		config.Load,
+		fakeAdminClient{},
+	)
+	if code != ExitSuccess || !strings.Contains(stdout.String(), "acceptance run --output") || stderr.Len() != 0 {
+		t.Fatalf("acceptance help code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = executeWithDependencies(
+		context.Background(),
+		[]string{"acceptance", "run"},
+		&stdout,
+		&stderr,
+		runnerFunc(func(context.Context) error { return nil }),
+		config.Load,
+		fakeAdminClient{},
+	)
+	if code != ExitUsage || !strings.Contains(stderr.String(), "invalid_arguments") {
+		t.Fatalf("acceptance usage code=%d stderr=%q", code, stderr.String())
 	}
 }
 

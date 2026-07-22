@@ -8,7 +8,7 @@ BINARY ?= $(BUILD_DIR)/pulse-agent-linux-$(GOARCH)
 GO_BUILD_FLAGS := -mod=readonly -trimpath -buildvcs=false
 GO_LDFLAGS := -s -w -buildid=
 
-.PHONY: build-linux reproducible-linux test
+.PHONY: acceptance build-linux reproducible-linux test
 
 build-linux:
 	mkdir -p "$(BUILD_DIR)"
@@ -21,3 +21,6 @@ reproducible-linux:
 
 test:
 	$(GO) test ./...
+
+acceptance:
+	$(GO) run ./cmd/pulse-agent acceptance run --output "acceptance-results" --go-bin "$(GO)"
