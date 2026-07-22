@@ -302,10 +302,23 @@ func selector(target contract.ServiceTarget) (string, string, bool) {
 		return "", "", false
 	}
 	kind, value, found := strings.Cut(target.Selector, ":")
-	if !found || value == "" || strings.Contains(value, ":") || (kind != "container" && kind != "compose_service") {
+	if !found || !validSelectorValue(value) || (kind != "container" && kind != "compose_service") {
 		return "", "", false
 	}
 	return kind, value, true
+}
+
+func validSelectorValue(value string) bool {
+	if value == "" || len(value) > 96 || strings.Contains(value, "..") {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || (index > 0 && (character == '.' || character == '_' || character == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validAction(target contract.ServiceTarget, action contract.TypedAction) error {

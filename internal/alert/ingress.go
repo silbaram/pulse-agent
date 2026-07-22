@@ -172,6 +172,13 @@ func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byt
 	if err := ctx.Err(); err != nil {
 		return Normalized{}, err
 	}
+	replayed, err := i.hasActiveReceipt(headers.ID, now)
+	if err != nil {
+		return Normalized{}, err
+	}
+	if replayed {
+		return Normalized{}, ErrReplay
+	}
 	decoded, err := decode(raw)
 	if err != nil {
 		if auditErr := i.recordRejected(now, "invalid_payload"); auditErr != nil {
@@ -220,6 +227,23 @@ func (i *Ingress) Accept(ctx context.Context, headers webhook.Headers, raw []byt
 		return Normalized{}, err
 	}
 	return normalized, nil
+}
+
+func (i *Ingress) hasActiveReceipt(id string, now time.Time) (bool, error) {
+	replayed := false
+	err := i.state.View(func(tx *store.Tx) error {
+		document, found, err := tx.Get(store.BucketIngressReceipts, id)
+		if err != nil || !found {
+			return err
+		}
+		var old receipt
+		if json.Unmarshal(document, &old) != nil || old.ExpiresAt.IsZero() {
+			return ErrInvalidAlert
+		}
+		replayed = old.ExpiresAt.After(now)
+		return nil
+	})
+	return replayed, err
 }
 
 func (i *Ingress) recordAccept(ctx context.Context, normalized Normalized, acceptErr error, duration time.Duration) {
